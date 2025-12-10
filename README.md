@@ -1,13 +1,32 @@
 # Search Ads CLI
 
+[![PyPI version](https://img.shields.io/pypi/v/search-ads-cli.svg)](https://pypi.org/project/search-ads-cli/)
+[![Python](https://img.shields.io/pypi/pyversions/search-ads-cli.svg)](https://pypi.org/project/search-ads-cli/)
+[![License](https://img.shields.io/github/license/SamPetherbridge/search-ads-cli.svg)](https://github.com/SamPetherbridge/search-ads-cli/blob/main/LICENSE)
+[![CI](https://github.com/SamPetherbridge/search-ads-cli/actions/workflows/ci.yml/badge.svg)](https://github.com/SamPetherbridge/search-ads-cli/actions/workflows/ci.yml)
+
 A command-line interface for managing Apple Search Ads campaigns.
 
 Built on top of [search-ads-api](https://github.com/SamPetherbridge/search-ads-api).
 
 ## Installation
 
+Using [uv](https://docs.astral.sh/uv/) (recommended):
+
+```bash
+uv tool install search-ads-cli
+```
+
+Using pip:
+
 ```bash
 pip install search-ads-cli
+```
+
+Using pipx:
+
+```bash
+pipx install search-ads-cli
 ```
 
 ## Setup
@@ -124,6 +143,21 @@ asa optimize bid-check --auto-fix
 
 # With threshold
 asa optimize bid-check --threshold 0.05
+```
+
+## Shell Completion
+
+Install shell completion for your shell:
+
+```bash
+# Bash
+asa --install-completion bash
+
+# Zsh
+asa --install-completion zsh
+
+# Fish
+asa --install-completion fish
 ```
 
 ## License
