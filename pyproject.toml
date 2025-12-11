@@ -33,9 +33,6 @@ dependencies = [
     "rich>=13.9.0",
 ]
 
-[tool.uv.sources]
-asa-api-client = { path = "../search-ads-api", editable = true }
-
 [project.scripts]
 asa = "asa_api_cli:app"
 
