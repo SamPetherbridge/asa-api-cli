@@ -5,7 +5,16 @@ from typing import Annotated
 import typer
 from rich.console import Console
 
-from asa_api_cli import ad_groups, auth, brand, campaigns, keywords, optimize, reports
+from asa_api_cli import (
+    ad_groups,
+    auth,
+    brand,
+    campaigns,
+    impression_share,
+    keywords,
+    optimize,
+    reports,
+)
 
 app = typer.Typer(
     name="asa",
@@ -23,6 +32,9 @@ app.add_typer(ad_groups.app, name="ad-groups", help="Manage ad groups")
 app.add_typer(keywords.app, name="keywords", help="Manage keywords")
 app.add_typer(reports.app, name="reports", help="Generate reports")
 app.add_typer(optimize.app, name="optimize", help="Optimization tools")
+app.add_typer(
+    impression_share.app, name="impression-share", help="Impression share analysis"
+)
 
 
 def version_callback(value: bool) -> None:
