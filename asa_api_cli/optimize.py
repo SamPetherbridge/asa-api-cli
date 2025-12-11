@@ -1148,6 +1148,9 @@ def review_keyword_bids(
                 return
 
             # Apply filters
+            # Filter out keywords with no data (UNKNOWN strength)
+            keyword_analyses = [k for k in keyword_analyses if k.bid_strength != "UNKNOWN"]
+
             if min_impressions > 0:
                 keyword_analyses = [k for k in keyword_analyses if k.impressions >= min_impressions]
 
