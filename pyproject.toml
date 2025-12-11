@@ -28,10 +28,13 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    "asa-api-client>=0.1.0",
+    "asa-api-client>=0.1.2",
     "typer>=0.13.0",
     "rich>=13.9.0",
 ]
+
+[tool.uv.sources]
+asa-api-client = { path = "../search-ads-api", editable = true }
 
 [project.scripts]
 asa = "asa_api_cli:app"
@@ -43,6 +46,7 @@ dev = [
     "pytest-cov>=6.0.0",
     "mypy>=1.13.0",
     "ruff>=0.8.0",
+    "pre-commit>=4.0.0",
 ]
 
 [project.urls]
@@ -59,7 +63,6 @@ testpaths = ["tests"]
 [tool.mypy]
 python_version = "3.13"
 strict = true
-plugins = ["pydantic.mypy"]
 ignore_missing_imports = true
 warn_unused_ignores = false
 
