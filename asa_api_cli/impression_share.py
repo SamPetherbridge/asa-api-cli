@@ -597,32 +597,38 @@ class KeywordInfo:
     ttr: float | None = None
 
 
-def _build_keyword_index(
+def _build_keyword_index_all_countries(
     client: "AppleSearchAdsClient",
-    country: str,
+    countries: set[str],
     start_date: date | None = None,
     end_date: date | None = None,
-) -> dict[str, list[KeywordInfo]]:
-    """Build an index of keywords by text for a given country.
+) -> dict[str, dict[str, list[KeywordInfo]]]:
+    """Build an index of keywords by text for ALL countries at once.
 
-    Returns a dict mapping lowercase keyword text -> list of KeywordInfo
-    (multiple campaigns may have the same keyword).
+    This is much more efficient than building per-country because it only
+    makes one pass through campaigns/ad_groups/keywords.
+
+    Returns a dict: country -> (keyword_text -> list[KeywordInfo])
 
     If start_date and end_date are provided, also fetches performance data
     for bid strength calculation.
     """
-    keyword_index: dict[str, list[KeywordInfo]] = {}
+    # Initialize empty index for each country
+    keyword_indices: dict[str, dict[str, list[KeywordInfo]]] = {c.upper(): {} for c in countries}
 
-    # Get enabled campaigns for this country
+    # Get ALL enabled campaigns in ONE call
     campaigns = list(client.campaigns.find(Selector().where("status", "==", "ENABLED")))
 
     for campaign in campaigns:
-        # Check if campaign targets this country
-        if country.upper() not in [c.upper() for c in campaign.countries_or_regions]:
+        # Get countries this campaign targets that we care about
+        campaign_countries = {c.upper() for c in campaign.countries_or_regions}
+        relevant_countries = campaign_countries & {c.upper() for c in countries}
+
+        if not relevant_countries:
             continue
 
-        # If date range provided, fetch keyword performance report
-        keyword_performance: dict[int, tuple[int, int, float | None]] = {}  # keyword_id -> (impr, taps, ttr)
+        # Fetch keyword performance report ONCE per campaign (if dates provided)
+        keyword_performance: dict[int, tuple[int, int, float | None]] = {}
         if start_date and end_date:
             try:
                 report = client.reports.keywords(
@@ -640,14 +646,14 @@ def _build_keyword_index(
             except AppleSearchAdsError:
                 pass
 
-        # Get ad groups for this campaign
+        # Get ad groups for this campaign ONCE
         try:
             ad_groups = list(client.campaigns(campaign.id).ad_groups.find(Selector().where("status", "==", "ENABLED")))
         except AppleSearchAdsError:
             continue
 
         for ad_group in ad_groups:
-            # Get keywords for this ad group
+            # Get keywords for this ad group ONCE
             try:
                 keywords = list(client.campaigns(campaign.id).ad_groups(ad_group.id).keywords.list())
             except AppleSearchAdsError:
@@ -655,8 +661,6 @@ def _build_keyword_index(
 
             for keyword in keywords:
                 kw_text = keyword.text.lower()
-
-                # Get performance data if available
                 perf = keyword_performance.get(keyword.id, (0, 0, None))
 
                 info = KeywordInfo(
@@ -673,11 +677,13 @@ def _build_keyword_index(
                     ttr=perf[2],
                 )
 
-                if kw_text not in keyword_index:
-                    keyword_index[kw_text] = []
-                keyword_index[kw_text].append(info)
+                # Add to ALL relevant countries
+                for ctry in relevant_countries:
+                    if kw_text not in keyword_indices[ctry]:
+                        keyword_indices[ctry][kw_text] = []
+                    keyword_indices[ctry][kw_text].append(info)
 
-    return keyword_index
+    return keyword_indices
 
 
 @app.command("correlate")
@@ -768,16 +774,11 @@ def correlate_impression_share(
             countries_in_data = {item.country.upper() for item in aggregated.values() if item.country}
             print_info(f"Found data for {len(countries_in_data)} countries: {', '.join(sorted(countries_in_data))}")
 
-            # Step 2: Build keyword index for each country (with performance data)
-            keyword_indices: dict[str, dict[str, list[KeywordInfo]]] = {}
-            total_keywords = 0
+            # Step 2: Build keyword index for ALL countries at once (much more efficient)
+            with spinner(f"Building keyword index for {len(countries_in_data)} countries (with performance data)..."):
+                keyword_indices = _build_keyword_index_all_countries(client, countries_in_data, start_date, end_date)
 
-            for ctry in countries_in_data:
-                with spinner(f"Building keyword index for {ctry} (with performance data)..."):
-                    keyword_indices[ctry] = _build_keyword_index(client, ctry, start_date, end_date)
-                    kw_count = sum(len(v) for v in keyword_indices[ctry].values())
-                    total_keywords += kw_count
-
+            total_keywords = sum(len(v) for idx in keyword_indices.values() for v in idx.values())
             print_info(f"Indexed {total_keywords} keywords across {len(countries_in_data)} countries")
 
             # Step 3: Correlate data
@@ -983,6 +984,250 @@ def correlate_impression_share(
                 console.print(
                     f"\n[red]⚠ {low_share_matched} matched keywords have <30% share - consider bid increases[/red]"
                 )
+
+    except AppleSearchAdsError as e:
+        handle_api_error(e)
+        raise typer.Exit(1) from None
+
+
+def _display_bid_item(item: CorrelatedSearchTerm, index: int) -> None:
+    """Display a single bid adjustment item with current status."""
+    share_color = "green"
+    if item.high_share:
+        if item.high_share < 0.3:
+            share_color = "red"
+        elif item.high_share < 0.5:
+            share_color = "yellow"
+
+    strength = item.bid_strength
+    strength_display = {
+        "STRONG": "[green]STRONG[/green]",
+        "MODERATE": "[yellow]MOD[/yellow]",
+        "WEAK": "[red]WEAK[/red]",
+    }.get(strength, "[dim]—[/dim]")
+
+    console.print(f"\n[bold cyan]#{index + 1}[/bold cyan] [bold]{item.search_term}[/bold]")
+    console.print(f"  Country: {item.country}  |  Campaign: {item.campaign_name}")
+    console.print(
+        f"  Share: [{share_color}]{item.share_range}[/{share_color}]  |  "
+        f"Strength: {strength_display}  |  "
+        f"Popularity: {item.search_popularity or '—'}"
+    )
+    console.print(f"  [bold]Current Bid: {item.currency or 'USD'} {item.current_bid:.2f}[/bold]")
+
+
+def _suggest_bid(item: CorrelatedSearchTerm) -> Decimal:
+    """Suggest a new bid based on impression share and current bid."""
+    if item.current_bid is None:
+        return Decimal("1.00")
+
+    current = item.current_bid
+    avg_share = item.avg_share
+
+    # Suggest increase based on how much share is missing
+    if avg_share < 0.2:
+        # Very low share - suggest 50% increase
+        return (current * Decimal("1.50")).quantize(Decimal("0.01"))
+    elif avg_share < 0.4:
+        # Low share - suggest 25% increase
+        return (current * Decimal("1.25")).quantize(Decimal("0.01"))
+    elif avg_share < 0.6:
+        # Medium share - suggest 10% increase
+        return (current * Decimal("1.10")).quantize(Decimal("0.01"))
+    else:
+        # Good share - suggest 5% increase
+        return (current * Decimal("1.05")).quantize(Decimal("0.01"))
+
+
+@app.command("bid-adjust")
+def bid_adjust(
+    days: Annotated[int, typer.Option("--days", "-d", help="Number of days to analyze")] = 7,
+    country: Annotated[str | None, typer.Option("--country", "-c", help="Filter by country")] = None,
+    min_share: Annotated[
+        float | None, typer.Option("--min-share", help="Only show keywords with share below this %")
+    ] = 50,
+    auto_apply: Annotated[bool, typer.Option("--auto", help="Auto-apply suggested bids without prompting")] = False,
+) -> None:
+    """Interactively adjust keyword bids based on impression share.
+
+    Shows keywords with low impression share and allows you to adjust bids
+    one by one. Each keyword shows current bid, share, and a suggested new bid.
+
+    Examples:
+        asa impression-share bid-adjust                      # Interactive mode
+        asa impression-share bid-adjust --country US         # Single country
+        asa impression-share bid-adjust --min-share 30       # Only <30% share
+        asa impression-share bid-adjust --auto               # Auto-apply suggestions
+    """
+    from asa_api_client.models.base import Money
+    from asa_api_client.models.keywords import KeywordUpdate
+
+    client = get_client()
+    days = min(max(days, 1), 30)
+
+    try:
+        end_date = date.today() - timedelta(days=1)
+        start_date = end_date - timedelta(days=days - 1)
+
+        # Get impression share data
+        with spinner("Fetching impression share data..."):
+            report = client.custom_reports.get_impression_share(
+                start_date=start_date,
+                end_date=end_date,
+                granularity=GranularityType.DAILY,
+            )
+
+        if not report.row:
+            print_warning("No impression share data found")
+            raise typer.Exit(0)
+
+        print_success(f"Retrieved {len(report.row)} records")
+
+        # Parse and aggregate
+        raw_data = _parse_report_data(report)
+        aggregated_dict = _aggregate_by_search_term(raw_data)
+        aggregated = list(aggregated_dict.values())
+
+        # Filter by country if specified
+        if country:
+            country_upper = country.upper()
+            aggregated = [d for d in aggregated if d.country == country_upper]
+            if not aggregated:
+                print_warning(f"No data found for country {country_upper}")
+                raise typer.Exit(0)
+
+        countries_in_data = {d.country for d in aggregated}
+
+        # Build keyword index for matching
+        with spinner(f"Building keyword index for {len(countries_in_data)} countries..."):
+            keyword_indices = _build_keyword_index_all_countries(client, countries_in_data, start_date, end_date)
+
+        # Correlate search terms with keywords
+        correlated: list[CorrelatedSearchTerm] = []
+        for data in aggregated:
+            country_index = keyword_indices.get(data.country.upper(), {})
+            search_term_lower = data.search_term.lower()
+            matches = country_index.get(search_term_lower, [])
+
+            if matches:
+                # Use best match (most specific keyword)
+                best = min(matches, key=lambda k: len(k.keyword_text))
+                correlated.append(
+                    CorrelatedSearchTerm(
+                        search_term=data.search_term,
+                        country=data.country,
+                        app_name=data.app_name,
+                        low_share=data.low_share,
+                        high_share=data.high_share,
+                        rank=data.rank,
+                        search_popularity=data.search_popularity,
+                        campaign_id=best.campaign_id,
+                        campaign_name=best.campaign_name,
+                        ad_group_id=best.ad_group_id,
+                        ad_group_name=best.ad_group_name,
+                        keyword_id=best.keyword_id,
+                        keyword_text=best.keyword_text,
+                        current_bid=best.bid_amount,
+                        currency=best.currency,
+                        impressions=best.impressions,
+                        taps=best.taps,
+                        ttr=best.ttr,
+                    )
+                )
+
+        if not correlated:
+            print_warning("No keywords matched to search terms")
+            raise typer.Exit(0)
+
+        # Filter to only matched keywords with low share
+        if min_share is not None:
+            threshold = min_share / 100.0
+            candidates = [
+                c for c in correlated if c.is_matched and c.high_share is not None and c.high_share < threshold
+            ]
+        else:
+            candidates = [c for c in correlated if c.is_matched]
+
+        # Sort by share (lowest first)
+        candidates.sort(key=lambda c: c.avg_share)
+
+        if not candidates:
+            print_success("No keywords need bid adjustments!")
+            raise typer.Exit(0)
+
+        console.print(f"\n[bold]Found {len(candidates)} keywords for bid review[/bold]")
+        console.print("[dim]Commands: (y)es, (n)o, (s)kip, (q)uit, or enter custom bid[/dim]\n")
+
+        # Track changes
+        changes_made: list[tuple[CorrelatedSearchTerm, Decimal, Decimal]] = []  # (item, old, new)
+
+        for i, item in enumerate(candidates):
+            _display_bid_item(item, i)
+
+            suggested = _suggest_bid(item)
+            console.print(f"  [green]Suggested Bid: {item.currency or 'USD'} {suggested:.2f}[/green]")
+
+            if auto_apply:
+                response = "y"
+            else:
+                response = typer.prompt(
+                    "  Apply suggested bid? [y/n/s/q/amount]",
+                    default="n",
+                    show_default=False,
+                )
+
+            response = response.strip().lower()
+
+            if response == "q":
+                console.print("\n[yellow]Quit - stopping review[/yellow]")
+                break
+            elif response == "s":
+                console.print("  [dim]Skipped[/dim]")
+                continue
+            elif response == "n":
+                console.print("  [dim]No change[/dim]")
+                continue
+            elif response == "y":
+                new_bid = suggested
+            else:
+                # Try to parse as custom amount
+                try:
+                    new_bid = Decimal(response).quantize(Decimal("0.01"))
+                    if new_bid <= 0:
+                        console.print("  [red]Invalid bid amount[/red]")
+                        continue
+                except Exception:
+                    console.print("  [red]Invalid input, skipping[/red]")
+                    continue
+
+            # Apply the bid change using bulk update API
+            if item.campaign_id and item.ad_group_id and item.keyword_id:
+                try:
+                    update = KeywordUpdate(bid_amount=Money(amount=str(new_bid), currency=item.currency or "USD"))
+                    client.campaigns(item.campaign_id).ad_groups(item.ad_group_id).keywords.update_bulk(
+                        [(item.keyword_id, update)]
+                    )
+                    old_bid = item.current_bid or Decimal("0")
+                    changes_made.append((item, old_bid, new_bid))
+                    console.print(f"  [green]Updated: {item.currency or 'USD'} {old_bid:.2f} -> {new_bid:.2f}[/green]")
+                except AppleSearchAdsError as e:
+                    console.print(f"  [red]Failed to update: {e}[/red]")
+            else:
+                console.print("  [red]Missing campaign/ad_group/keyword ID[/red]")
+
+        # Summary
+        console.print("\n" + "=" * 50)
+        if changes_made:
+            console.print(f"[bold green]Applied {len(changes_made)} bid changes:[/bold green]")
+            for item, old, new in changes_made:
+                change_pct = ((new - old) / old * 100) if old > 0 else 0
+                console.print(
+                    f"  {item.keyword_text} ({item.country}): "
+                    f"{item.currency or 'USD'} {old:.2f} -> {new:.2f} "
+                    f"[dim](+{change_pct:.0f}%)[/dim]"
+                )
+        else:
+            console.print("[dim]No changes made[/dim]")
 
     except AppleSearchAdsError as e:
         handle_api_error(e)
