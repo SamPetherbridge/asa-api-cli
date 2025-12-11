@@ -538,6 +538,10 @@ class CorrelatedSearchTerm:
     keyword_text: str | None = None
     current_bid: Decimal | None = None
     currency: str | None = None
+    # Performance data for bid strength
+    impressions: int = 0
+    taps: int = 0
+    ttr: float | None = None
 
     @property
     def share_range(self) -> str:
@@ -562,6 +566,18 @@ class CorrelatedSearchTerm:
         """Whether this search term was matched to a keyword."""
         return self.keyword_id is not None
 
+    @property
+    def bid_strength(self) -> str:
+        """Estimate bid strength based on impressions and TTR."""
+        if self.impressions == 0:
+            return "UNKNOWN"
+        ttr = self.ttr or 0.0
+        if self.impressions >= 1000 and ttr >= 0.05:
+            return "STRONG"
+        elif self.impressions >= 100 and ttr >= 0.02:
+            return "MODERATE"
+        return "WEAK"
+
 
 @dataclass
 class KeywordInfo:
@@ -575,16 +591,25 @@ class KeywordInfo:
     ad_group_name: str
     bid_amount: Decimal
     currency: str
+    # Performance data
+    impressions: int = 0
+    taps: int = 0
+    ttr: float | None = None
 
 
 def _build_keyword_index(
     client: "AppleSearchAdsClient",
     country: str,
+    start_date: date | None = None,
+    end_date: date | None = None,
 ) -> dict[str, list[KeywordInfo]]:
     """Build an index of keywords by text for a given country.
 
     Returns a dict mapping lowercase keyword text -> list of KeywordInfo
     (multiple campaigns may have the same keyword).
+
+    If start_date and end_date are provided, also fetches performance data
+    for bid strength calculation.
     """
     keyword_index: dict[str, list[KeywordInfo]] = {}
 
@@ -595,6 +620,25 @@ def _build_keyword_index(
         # Check if campaign targets this country
         if country.upper() not in [c.upper() for c in campaign.countries_or_regions]:
             continue
+
+        # If date range provided, fetch keyword performance report
+        keyword_performance: dict[int, tuple[int, int, float | None]] = {}  # keyword_id -> (impr, taps, ttr)
+        if start_date and end_date:
+            try:
+                report = client.reports.keywords(
+                    campaign_id=campaign.id,
+                    start_date=start_date,
+                    end_date=end_date,
+                    granularity=GranularityType.DAILY,
+                )
+                for row in report.row:
+                    if row.metadata.keyword_id and row.total:
+                        impr = row.total.impressions or 0
+                        taps = row.total.taps or 0
+                        ttr = taps / impr if impr > 0 else None
+                        keyword_performance[row.metadata.keyword_id] = (impr, taps, ttr)
+            except AppleSearchAdsError:
+                pass
 
         # Get ad groups for this campaign
         try:
@@ -611,6 +655,10 @@ def _build_keyword_index(
 
             for keyword in keywords:
                 kw_text = keyword.text.lower()
+
+                # Get performance data if available
+                perf = keyword_performance.get(keyword.id, (0, 0, None))
+
                 info = KeywordInfo(
                     keyword_id=keyword.id,
                     keyword_text=keyword.text,
@@ -620,6 +668,9 @@ def _build_keyword_index(
                     ad_group_name=ad_group.name,
                     bid_amount=Decimal(keyword.bid_amount.amount) if keyword.bid_amount else Decimal("0"),
                     currency=keyword.bid_amount.currency if keyword.bid_amount else "USD",
+                    impressions=perf[0],
+                    taps=perf[1],
+                    ttr=perf[2],
                 )
 
                 if kw_text not in keyword_index:
@@ -717,13 +768,13 @@ def correlate_impression_share(
             countries_in_data = {item.country.upper() for item in aggregated.values() if item.country}
             print_info(f"Found data for {len(countries_in_data)} countries: {', '.join(sorted(countries_in_data))}")
 
-            # Step 2: Build keyword index for each country
+            # Step 2: Build keyword index for each country (with performance data)
             keyword_indices: dict[str, dict[str, list[KeywordInfo]]] = {}
             total_keywords = 0
 
             for ctry in countries_in_data:
-                with spinner(f"Building keyword index for {ctry}..."):
-                    keyword_indices[ctry] = _build_keyword_index(client, ctry)
+                with spinner(f"Building keyword index for {ctry} (with performance data)..."):
+                    keyword_indices[ctry] = _build_keyword_index(client, ctry, start_date, end_date)
                     kw_count = sum(len(v) for v in keyword_indices[ctry].values())
                     total_keywords += kw_count
 
@@ -757,6 +808,9 @@ def correlate_impression_share(
                             keyword_text=match.keyword_text,
                             current_bid=match.bid_amount,
                             currency=match.currency,
+                            impressions=match.impressions,
+                            taps=match.taps,
+                            ttr=match.ttr,
                         )
                     )
                 else:
@@ -815,6 +869,10 @@ def correlate_impression_share(
                                 "keyword_text",
                                 "current_bid",
                                 "currency",
+                                "impressions",
+                                "taps",
+                                "ttr",
+                                "bid_strength",
                             ]
                         )
                         for row in correlated:
@@ -832,6 +890,10 @@ def correlate_impression_share(
                                     row.keyword_text or "",
                                     row.current_bid or "",
                                     row.currency or "",
+                                    row.impressions if row.is_matched else "",
+                                    row.taps if row.is_matched else "",
+                                    f"{row.ttr:.4f}" if row.ttr else "",
+                                    row.bid_strength if row.is_matched else "",
                                 ]
                             )
                     print_success(f"Exported {len(correlated)} rows to {output}")
@@ -851,9 +913,9 @@ def correlate_impression_share(
             table.add_column("Search Term", style="cyan", max_width=30)
             table.add_column("Ctry", style="dim", width=4)
             table.add_column("Share", justify="right", width=8)
-            table.add_column("Campaign", style="magenta", max_width=25)
-            table.add_column("Keyword", style="dim", max_width=20)
-            table.add_column("Bid", justify="right", width=10)
+            table.add_column("Campaign", style="magenta", max_width=20)
+            table.add_column("Bid", justify="right", width=8)
+            table.add_column("Strength", justify="center", width=8)
             table.add_column("Pop", justify="center", width=3)
 
             for row in correlated[:display_limit]:
@@ -864,17 +926,30 @@ def correlate_impression_share(
                     elif row.high_share < 0.5:
                         share_style = "yellow"
 
-                bid_display = f"{row.current_bid:.2f} {row.currency}" if row.current_bid else "[dim]—[/dim]"
-                campaign_display = row.campaign_name[:25] if row.campaign_name else "[dim]Not matched[/dim]"
-                keyword_display = row.keyword_text[:20] if row.keyword_text else ""
+                bid_display = f"{row.current_bid:.2f}" if row.current_bid else "[dim]—[/dim]"
+                campaign_display = row.campaign_name[:20] if row.campaign_name else "[dim]Not matched[/dim]"
+
+                # Bid strength display
+                if row.is_matched:
+                    strength = row.bid_strength
+                    if strength == "STRONG":
+                        strength_display = "[green]STRONG[/green]"
+                    elif strength == "MODERATE":
+                        strength_display = "[yellow]MOD[/yellow]"
+                    elif strength == "WEAK":
+                        strength_display = "[red]WEAK[/red]"
+                    else:
+                        strength_display = "[dim]—[/dim]"
+                else:
+                    strength_display = "[dim]—[/dim]"
 
                 table.add_row(
                     row.search_term[:30],
                     row.country,
                     f"[{share_style}]{row.share_range}[/{share_style}]",
                     campaign_display,
-                    keyword_display,
                     bid_display,
+                    strength_display,
                     str(row.search_popularity) if row.search_popularity else "—",
                 )
 
@@ -887,6 +962,21 @@ def correlate_impression_share(
             console.print(f"\n[dim]Total search terms:[/dim] {len(correlated)}")
             console.print(f"  [green]Matched to keywords:[/green] {matched_count}")
             console.print(f"  [yellow]Unmatched (opportunities):[/yellow] {unmatched_count}")
+
+            # Bid strength summary for matched keywords
+            matched_items = [c for c in correlated if c.is_matched]
+            if matched_items:
+                strong = sum(1 for c in matched_items if c.bid_strength == "STRONG")
+                moderate = sum(1 for c in matched_items if c.bid_strength == "MODERATE")
+                weak = sum(1 for c in matched_items if c.bid_strength == "WEAK")
+                unknown = sum(1 for c in matched_items if c.bid_strength == "UNKNOWN")
+
+                console.print("\n[dim]Bid Strength (matched keywords):[/dim]")
+                console.print(f"  [green]Strong:[/green] {strong}")
+                console.print(f"  [yellow]Moderate:[/yellow] {moderate}")
+                console.print(f"  [red]Weak:[/red] {weak}")
+                if unknown > 0:
+                    console.print(f"  [dim]No data:[/dim] {unknown}")
 
             low_share_matched = sum(1 for c in correlated if c.is_matched and c.high_share and c.high_share < 0.3)
             if low_share_matched > 0:
