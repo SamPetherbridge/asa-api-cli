@@ -301,10 +301,10 @@ def analyze_impression_share(
     mid_share_count = sum(1 for d in data if d.high_share and 0.3 <= d.high_share < 0.5)
     high_share_count = sum(1 for d in data if d.high_share and d.high_share >= 0.5)
 
-    print_info(f"\nTotal unique search terms: {len(data)}")
-    print_info(f"  Low share (<30%): {low_share_count} - [red]bid increase suggested[/red]")
-    print_info(f"  Medium share (30-50%): {mid_share_count} - [yellow]consider increase[/yellow]")
-    print_info(f"  High share (50%+): {high_share_count} - [green]performing well[/green]")
+    console.print(f"\n[dim]Total unique search terms:[/dim] {len(data)}")
+    console.print(f"  [dim]Low share (<30%):[/dim] {low_share_count} - [red]bid increase suggested[/red]")
+    console.print(f"  [dim]Medium share (30-50%):[/dim] {mid_share_count} - [yellow]consider increase[/yellow]")
+    console.print(f"  [dim]High share (50%+):[/dim] {high_share_count} - [green]performing well[/green]")
 
 
 @app.command("report")
