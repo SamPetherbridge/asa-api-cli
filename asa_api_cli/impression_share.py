@@ -166,7 +166,7 @@ def _display_share_table(data: list[KeywordShareData], show_suggestions: bool = 
 def analyze_impression_share(
     days: Annotated[
         int,
-        typer.Option("--days", "-d", help="Number of days to analyze (max 84)"),
+        typer.Option("--days", "-d", help="Number of days to analyze (max 30)"),
     ] = 7,
     country: Annotated[
         str | None,
@@ -198,13 +198,13 @@ def analyze_impression_share(
     """
     client = get_client()
 
-    # Validate days
-    if days > 84:
-        print_warning("Maximum lookback is 84 days (12 weeks), using 84")
-        days = 84
+    # Validate days - API limits to 30 days max
+    if days > 30:
+        print_warning("Maximum lookback is 30 days, using 30")
+        days = 30
 
     end_date = date.today() - timedelta(days=1)
-    start_date = end_date - timedelta(days=days)
+    start_date = end_date - timedelta(days=days - 1)  # -1 because range is inclusive
 
     country_codes = [country.upper()] if country else None
 
@@ -289,7 +289,7 @@ def analyze_impression_share(
 def interactive_bid_optimizer(
     days: Annotated[
         int,
-        typer.Option("--days", "-d", help="Number of days to analyze (max 84)"),
+        typer.Option("--days", "-d", help="Number of days to analyze (max 30)"),
     ] = 7,
     country: Annotated[
         str | None,
@@ -321,13 +321,13 @@ def interactive_bid_optimizer(
     """
     client = get_client()
 
-    # Validate days
-    if days > 84:
-        print_warning("Maximum lookback is 84 days, using 84")
-        days = 84
+    # Validate days - API limits to 30 days max
+    if days > 30:
+        print_warning("Maximum lookback is 30 days, using 30")
+        days = 30
 
     end_date = date.today() - timedelta(days=1)
-    start_date = end_date - timedelta(days=days)
+    start_date = end_date - timedelta(days=days - 1)  # -1 because range is inclusive
 
     country_codes = [country.upper()] if country else None
 
@@ -467,7 +467,7 @@ def interactive_bid_optimizer(
 def generate_share_report(
     days: Annotated[
         int,
-        typer.Option("--days", "-d", help="Number of days to analyze"),
+        typer.Option("--days", "-d", help="Number of days to analyze (max 30)"),
     ] = 7,
     output: Annotated[
         str | None,
@@ -488,12 +488,13 @@ def generate_share_report(
     """
     client = get_client()
 
-    if days > 84:
-        print_warning("Maximum lookback is 84 days, using 84")
-        days = 84
+    # API limits to 30 days max
+    if days > 30:
+        print_warning("Maximum lookback is 30 days, using 30")
+        days = 30
 
     end_date = date.today() - timedelta(days=1)
-    start_date = end_date - timedelta(days=days)
+    start_date = end_date - timedelta(days=days - 1)  # -1 because range is inclusive
 
     country_codes = [country.upper()] if country else None
 
