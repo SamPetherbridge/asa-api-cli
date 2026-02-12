@@ -10,10 +10,14 @@ from pydantic import ValidationError
 from rich.table import Table
 
 from asa_api_cli.utils import (
+    EXIT_ERROR,
+    EXIT_USAGE,
     console,
+    error_console,
     print_error,
     print_info,
     print_result_panel,
+    print_warning,
     spinner,
 )
 
@@ -67,10 +71,10 @@ def test_auth(
             else:
                 table.add_row(f"ASA_{field.upper()}", "[success]OK[/success]")
 
-        console.print(table)
-        console.print()
+        error_console.print(table)
+        error_console.print()
         print_error("Configuration Error", "Missing or invalid settings")
-        raise typer.Exit(1) from None
+        raise typer.Exit(EXIT_USAGE) from None
 
     # Display loaded configuration
     table = Table(
@@ -94,8 +98,14 @@ def test_auth(
     if settings.private_key:
         table.add_row("ASA_PRIVATE_KEY", "[success]<set>[/success]")
 
-    console.print(table)
-    console.print()
+    error_console.print(table)
+    error_console.print()
+
+    if settings.private_key and not settings.private_key_path:
+        print_warning(
+            "ASA_PRIVATE_KEY env var is deprecated. " "Use ASA_PRIVATE_KEY_PATH to reference a key file instead."
+        )
+        error_console.print()
 
     # Try to authenticate
     print_info("Attempting to authenticate...")
@@ -104,7 +114,7 @@ def test_auth(
         client = AppleSearchAdsClient.from_env(env_file=env_file)
     except ConfigurationError as e:
         print_error("Configuration Error", e.message)
-        raise typer.Exit(1) from None
+        raise typer.Exit(EXIT_ERROR) from None
 
     try:
         # Try to list campaigns to verify authentication works
@@ -122,7 +132,7 @@ def test_auth(
 
     except AppleSearchAdsError as e:
         print_error("API Error", e.message, f"Status code: {e.status_code}" if e.status_code else None)
-        raise typer.Exit(1) from None
+        raise typer.Exit(EXIT_ERROR) from None
 
 
 @app.command("show")
@@ -175,12 +185,18 @@ def show_config(
         else:
             table.add_row("ASA_PRIVATE_KEY", "[muted]<not set>[/muted]")
 
-        console.print(table)
+        error_console.print(table)
+
+        if settings.private_key and not settings.private_key_path:
+            error_console.print()
+            print_warning(
+                "ASA_PRIVATE_KEY env var is deprecated. " "Use ASA_PRIVATE_KEY_PATH to reference a key file instead."
+            )
 
     except ValidationError as e:
         print_error("Configuration Error", "Could not load settings")
         for err in e.errors():
             field = err["loc"][0]
             msg = err["msg"]
-            console.print(f"  [error]ASA_{str(field).upper()}:[/error] {msg}")
-        raise typer.Exit(1) from None
+            error_console.print(f"  [error]ASA_{str(field).upper()}:[/error] {msg}")
+        raise typer.Exit(EXIT_USAGE) from None

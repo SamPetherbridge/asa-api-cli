@@ -12,6 +12,8 @@ from rich.panel import Panel
 from rich.table import Table
 
 from asa_api_cli.utils import (
+    EXIT_ERROR,
+    EXIT_USAGE,
     console,
     format_number,
     format_percent,
@@ -165,7 +167,7 @@ def save_report(
             writer.writerows(data)
     else:
         print_error("Unsupported Format", f"File format '{suffix}' is not supported", "Supported formats: .json, .csv")
-        raise typer.Exit(1)
+        raise typer.Exit(EXIT_USAGE)
 
     print_success(f"Report saved to {output}")
 
@@ -235,7 +237,7 @@ def campaign_report(
 
     except AppleSearchAdsError as e:
         handle_api_error(e)
-        raise typer.Exit(1) from None
+        raise typer.Exit(EXIT_ERROR) from None
 
 
 @app.command("ad-groups")
@@ -298,7 +300,7 @@ def ad_group_report(
 
     except AppleSearchAdsError as e:
         handle_api_error(e)
-        raise typer.Exit(1) from None
+        raise typer.Exit(EXIT_ERROR) from None
 
 
 @app.command("keywords")
@@ -367,7 +369,7 @@ def keyword_report(
 
     except AppleSearchAdsError as e:
         handle_api_error(e)
-        raise typer.Exit(1) from None
+        raise typer.Exit(EXIT_ERROR) from None
 
 
 @app.command("search-terms")
@@ -437,4 +439,4 @@ def search_term_report(
 
     except AppleSearchAdsError as e:
         handle_api_error(e)
-        raise typer.Exit(1) from None
+        raise typer.Exit(EXIT_ERROR) from None

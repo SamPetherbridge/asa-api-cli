@@ -8,6 +8,8 @@ from asa_api_client.exceptions import AppleSearchAdsError
 from asa_api_client.models import CampaignStatus, CampaignUpdate, Money, Selector
 
 from asa_api_cli.utils import (
+    EXIT_ERROR,
+    EXIT_USAGE,
     OutputFormat,
     confirm_action,
     enum_value,
@@ -15,6 +17,7 @@ from asa_api_cli.utils import (
     get_client,
     handle_api_error,
     output_data,
+    print_hint,
     print_json,
     print_result_panel,
     print_success,
@@ -192,7 +195,7 @@ def list_campaigns(
 
     except AppleSearchAdsError as e:
         handle_api_error(e)
-        raise typer.Exit(1) from None
+        raise typer.Exit(EXIT_ERROR) from None
 
 
 @app.command("get")
@@ -224,7 +227,7 @@ def get_campaign(
 
     except AppleSearchAdsError as e:
         handle_api_error(e)
-        raise typer.Exit(1) from None
+        raise typer.Exit(EXIT_ERROR) from None
 
 
 @app.command("pause")
@@ -246,10 +249,11 @@ def pause_campaign(
                     data=CampaignUpdate(status=CampaignStatus.PAUSED),
                 )
             print_success(f"Campaign '{campaign.name}' paused")
+            print_hint(f"asa campaigns get {campaign_id}")
 
     except AppleSearchAdsError as e:
         handle_api_error(e)
-        raise typer.Exit(1) from None
+        raise typer.Exit(EXIT_ERROR) from None
 
 
 @app.command("enable")
@@ -271,10 +275,11 @@ def enable_campaign(
                     data=CampaignUpdate(status=CampaignStatus.ENABLED),
                 )
             print_success(f"Campaign '{campaign.name}' enabled")
+            print_hint(f"asa campaigns get {campaign_id}")
 
     except AppleSearchAdsError as e:
         handle_api_error(e)
-        raise typer.Exit(1) from None
+        raise typer.Exit(EXIT_ERROR) from None
 
 
 @app.command("set-budget")
@@ -302,7 +307,7 @@ def set_budget(
     """
     if daily_budget is None and total_budget is None:
         print_warning("Specify at least --daily or --total budget")
-        raise typer.Exit(1)
+        raise typer.Exit(EXIT_USAGE)
 
     client = get_client()
 
@@ -326,10 +331,11 @@ def set_budget(
                 result_data["Total Budget"] = f"{amt.amount} {amt.currency}"
 
             print_result_panel("Budget Updated", result_data)
+            print_hint(f"asa campaigns get {campaign_id}")
 
     except AppleSearchAdsError as e:
         handle_api_error(e)
-        raise typer.Exit(1) from None
+        raise typer.Exit(EXIT_ERROR) from None
 
 
 @app.command("delete")
@@ -368,4 +374,4 @@ def delete_campaign(
 
     except AppleSearchAdsError as e:
         handle_api_error(e)
-        raise typer.Exit(1) from None
+        raise typer.Exit(EXIT_ERROR) from None

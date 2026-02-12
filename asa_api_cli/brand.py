@@ -22,6 +22,8 @@ from rich.table import Table
 
 from asa_api_cli.optimize import CampaignNameParts, wait_for_resource
 from asa_api_cli.utils import (
+    EXIT_ERROR,
+    EXIT_USAGE,
     console,
     get_client,
     handle_api_error,
@@ -397,7 +399,7 @@ def _select_app_interactive(client: Any) -> tuple[int, str, str]:
 
     if not apps:
         print_error("No apps", "No campaigns found to get app information from")
-        raise typer.Exit(1)
+        raise typer.Exit(EXIT_ERROR)
 
     # Display apps
     table = Table(show_header=True)
@@ -420,10 +422,10 @@ def _select_app_interactive(client: Any) -> tuple[int, str, str]:
             return adam_id, app_name, currency
         else:
             print_error("Invalid selection", f"Please enter 1-{len(app_list)}")
-            raise typer.Exit(1)
+            raise typer.Exit(EXIT_USAGE)
     except ValueError:
         print_error("Invalid selection", "Please enter a number")
-        raise typer.Exit(1)
+        raise typer.Exit(EXIT_USAGE)
 
 
 def _get_brand_keywords_interactive(brand_name: str | None = None) -> list[str]:
@@ -570,7 +572,7 @@ def create_brand_campaigns(
 
             if not all_keywords:
                 print_error("No keywords", "At least one brand keyword is required")
-                raise typer.Exit(1)
+                raise typer.Exit(EXIT_USAGE)
 
             print_info(f"Brand keywords ({len(all_keywords)}): {', '.join(all_keywords)}")
 
@@ -592,7 +594,7 @@ def create_brand_campaigns(
 
             if not target_countries:
                 print_error("No countries", "No valid target countries selected")
-                raise typer.Exit(1)
+                raise typer.Exit(EXIT_USAGE)
 
             countries_preview = ", ".join(target_countries[:10])
             suffix = "..." if len(target_countries) > 10 else ""
@@ -810,4 +812,4 @@ def create_brand_campaigns(
 
     except AppleSearchAdsError as e:
         handle_api_error(e)
-        raise typer.Exit(1) from None
+        raise typer.Exit(EXIT_ERROR) from None
