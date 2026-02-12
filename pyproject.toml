@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "asa-api-cli"
-version = "0.1.0"
+version = "0.2.0"
 description = "Command-line interface for Apple Search Ads campaign management"
 readme = "README.md"
 license = "MIT"
@@ -31,6 +31,8 @@ dependencies = [
     "asa-api-client>=0.1.5",
     "typer>=0.13.0",
     "rich>=13.9.0",
+    "pydantic-ai>=0.1.0",
+    "pydantic-settings>=2.0.0",
 ]
 
 [project.scripts]
