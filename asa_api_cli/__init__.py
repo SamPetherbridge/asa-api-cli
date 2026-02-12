@@ -12,4 +12,4 @@ from asa_api_cli.main import app
 
 __all__ = ["app"]
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
