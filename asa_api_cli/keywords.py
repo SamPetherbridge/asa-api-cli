@@ -15,6 +15,7 @@ from asa_api_client.models import (
 )
 
 from asa_api_cli.utils import (
+    EXIT_ERROR,
     OutputFormat,
     confirm_action,
     enum_value,
@@ -22,6 +23,8 @@ from asa_api_cli.utils import (
     get_client,
     handle_api_error,
     output_data,
+    print_error,
+    print_hint,
     print_json,
     print_result_panel,
     print_success,
@@ -61,8 +64,14 @@ def keyword_to_dict(keyword: object) -> dict[str, Any]:
 
 @app.command("list")
 def list_keywords(
-    campaign_id: Annotated[int, typer.Argument(help="Campaign ID")],
-    ad_group_id: Annotated[int, typer.Argument(help="Ad Group ID")],
+    campaign_id: Annotated[
+        int,
+        typer.Option("--campaign", help="Campaign ID"),
+    ],
+    ad_group_id: Annotated[
+        int,
+        typer.Option("--ad-group", "-g", help="Ad Group ID"),
+    ],
     status: Annotated[
         KeywordStatus | None,
         typer.Option("--status", "-s", help="Filter by status"),
@@ -83,10 +92,10 @@ def list_keywords(
     """List targeting keywords in an ad group.
 
     Examples:
-        asa keywords list 123 456
-        asa keywords list 123 456 --status ACTIVE
-        asa keywords list 123 456 --match-type EXACT
-        asa keywords list 123 456 --format json
+        asa keywords list --campaign 123 --ad-group 456
+        asa keywords list --campaign 123 -g 456 --status ACTIVE
+        asa keywords list --campaign 123 -g 456 --match-type EXACT
+        asa keywords list --campaign 123 -g 456 --format json
     """
     client = get_client()
 
@@ -120,14 +129,20 @@ def list_keywords(
 
     except AppleSearchAdsError as e:
         handle_api_error(e)
-        raise typer.Exit(1) from None
+        raise typer.Exit(EXIT_ERROR) from None
 
 
 @app.command("get")
 def get_keyword(
-    campaign_id: Annotated[int, typer.Argument(help="Campaign ID")],
-    ad_group_id: Annotated[int, typer.Argument(help="Ad Group ID")],
     keyword_id: Annotated[int, typer.Argument(help="Keyword ID")],
+    campaign_id: Annotated[
+        int,
+        typer.Option("--campaign", help="Campaign ID"),
+    ],
+    ad_group_id: Annotated[
+        int,
+        typer.Option("--ad-group", "-g", help="Ad Group ID"),
+    ],
     format: Annotated[
         OutputFormat,
         typer.Option("--format", "-f", help="Output format"),
@@ -136,7 +151,7 @@ def get_keyword(
     """Get details for a specific keyword.
 
     Examples:
-        asa keywords get 123 456 789
+        asa keywords get 789 --campaign 123 --ad-group 456
     """
     client = get_client()
 
@@ -153,14 +168,20 @@ def get_keyword(
 
     except AppleSearchAdsError as e:
         handle_api_error(e)
-        raise typer.Exit(1) from None
+        raise typer.Exit(EXIT_ERROR) from None
 
 
 @app.command("add")
 def add_keyword(
-    campaign_id: Annotated[int, typer.Argument(help="Campaign ID")],
-    ad_group_id: Annotated[int, typer.Argument(help="Ad Group ID")],
     text: Annotated[str, typer.Argument(help="Keyword text")],
+    campaign_id: Annotated[
+        int,
+        typer.Option("--campaign", help="Campaign ID"),
+    ],
+    ad_group_id: Annotated[
+        int,
+        typer.Option("--ad-group", "-g", help="Ad Group ID"),
+    ],
     match_type: Annotated[
         KeywordMatchType,
         typer.Option("--match-type", "-m", help="Match type"),
@@ -177,9 +198,9 @@ def add_keyword(
     """Add a targeting keyword.
 
     Examples:
-        asa keywords add 123 456 "productivity app"
-        asa keywords add 123 456 "todo list" --match-type BROAD
-        asa keywords add 123 456 "task manager" --bid 2.50
+        asa keywords add "productivity app" --campaign 123 --ad-group 456
+        asa keywords add "todo list" --campaign 123 -g 456 --match-type BROAD
+        asa keywords add "task manager" --campaign 123 -g 456 --bid 2.50
     """
     client = get_client()
 
@@ -203,22 +224,29 @@ def add_keyword(
                     "Match Type": keyword.match_type.value,
                 },
             )
+            print_hint(f"asa keywords list --campaign {campaign_id} --ad-group {ad_group_id}")
 
     except AppleSearchAdsError as e:
         handle_api_error(e)
-        raise typer.Exit(1) from None
+        raise typer.Exit(EXIT_ERROR) from None
 
 
 @app.command("pause")
 def pause_keyword(
-    campaign_id: Annotated[int, typer.Argument(help="Campaign ID")],
-    ad_group_id: Annotated[int, typer.Argument(help="Ad Group ID")],
     keyword_id: Annotated[int, typer.Argument(help="Keyword ID to pause")],
+    campaign_id: Annotated[
+        int,
+        typer.Option("--campaign", help="Campaign ID"),
+    ],
+    ad_group_id: Annotated[
+        int,
+        typer.Option("--ad-group", "-g", help="Ad Group ID"),
+    ],
 ) -> None:
     """Pause a keyword.
 
     Examples:
-        asa keywords pause 123 456 789
+        asa keywords pause 789 --campaign 123 --ad-group 456
     """
     client = get_client()
 
@@ -234,19 +262,25 @@ def pause_keyword(
 
     except AppleSearchAdsError as e:
         handle_api_error(e)
-        raise typer.Exit(1) from None
+        raise typer.Exit(EXIT_ERROR) from None
 
 
 @app.command("enable")
 def enable_keyword(
-    campaign_id: Annotated[int, typer.Argument(help="Campaign ID")],
-    ad_group_id: Annotated[int, typer.Argument(help="Ad Group ID")],
     keyword_id: Annotated[int, typer.Argument(help="Keyword ID to enable")],
+    campaign_id: Annotated[
+        int,
+        typer.Option("--campaign", help="Campaign ID"),
+    ],
+    ad_group_id: Annotated[
+        int,
+        typer.Option("--ad-group", "-g", help="Ad Group ID"),
+    ],
 ) -> None:
     """Enable a paused keyword.
 
     Examples:
-        asa keywords enable 123 456 789
+        asa keywords enable 789 --campaign 123 --ad-group 456
     """
     client = get_client()
 
@@ -262,15 +296,21 @@ def enable_keyword(
 
     except AppleSearchAdsError as e:
         handle_api_error(e)
-        raise typer.Exit(1) from None
+        raise typer.Exit(EXIT_ERROR) from None
 
 
 @app.command("set-bid")
 def set_keyword_bid(
-    campaign_id: Annotated[int, typer.Argument(help="Campaign ID")],
-    ad_group_id: Annotated[int, typer.Argument(help="Ad Group ID")],
     keyword_id: Annotated[int, typer.Argument(help="Keyword ID")],
     bid: Annotated[float, typer.Argument(help="New bid amount")],
+    campaign_id: Annotated[
+        int,
+        typer.Option("--campaign", help="Campaign ID"),
+    ],
+    ad_group_id: Annotated[
+        int,
+        typer.Option("--ad-group", "-g", help="Ad Group ID"),
+    ],
     currency: Annotated[
         str,
         typer.Option("--currency", "-c", help="Currency code"),
@@ -279,41 +319,52 @@ def set_keyword_bid(
     """Set the bid for a keyword.
 
     Examples:
-        asa keywords set-bid 123 456 789 3.00
-        asa keywords set-bid 123 456 789 2.50 --currency EUR
+        asa keywords set-bid 789 3.00 --campaign 123 --ad-group 456
+        asa keywords set-bid 789 2.50 --campaign 123 -g 456 --currency EUR
     """
     client = get_client()
 
     try:
         with client:
             with spinner("Updating keyword bid..."):
-                keyword = (
+                # Apple API doesn't support single keyword PUT, must use bulk endpoint
+                result = (
                     client.campaigns(campaign_id)
                     .ad_groups(ad_group_id)
-                    .keywords.update(
-                        keyword_id,
-                        data=KeywordUpdate(bid_amount=Money(amount=str(bid), currency=currency)),
+                    .keywords.update_bulk(
+                        [(keyword_id, KeywordUpdate(bid_amount=Money(amount=str(bid), currency=currency)))]
                     )
                 )
 
-            print_result_panel(
-                "Keyword Bid Updated",
-                {
-                    "Keyword": keyword.text,
-                    "Bid": f"{keyword.bid_amount.amount} {keyword.bid_amount.currency}",
-                },
-            )
+            if result.data and len(result.data) > 0:
+                keyword = result.data[0]
+                print_result_panel(
+                    "Keyword Bid Updated",
+                    {
+                        "Keyword": keyword.text,
+                        "Bid": f"{keyword.bid_amount.amount} {keyword.bid_amount.currency}",
+                    },
+                )
+            else:
+                print_error("Update failed", "API returned empty response")
+                raise typer.Exit(EXIT_ERROR)
 
     except AppleSearchAdsError as e:
         handle_api_error(e)
-        raise typer.Exit(1) from None
+        raise typer.Exit(EXIT_ERROR) from None
 
 
 @app.command("delete")
 def delete_keyword(
-    campaign_id: Annotated[int, typer.Argument(help="Campaign ID")],
-    ad_group_id: Annotated[int, typer.Argument(help="Ad Group ID")],
     keyword_id: Annotated[int, typer.Argument(help="Keyword ID to delete")],
+    campaign_id: Annotated[
+        int,
+        typer.Option("--campaign", help="Campaign ID"),
+    ],
+    ad_group_id: Annotated[
+        int,
+        typer.Option("--ad-group", "-g", help="Ad Group ID"),
+    ],
     force: Annotated[
         bool,
         typer.Option("--force", "-f", help="Skip confirmation"),
@@ -322,8 +373,8 @@ def delete_keyword(
     """Delete a keyword.
 
     Examples:
-        asa keywords delete 123 456 789
-        asa keywords delete 123 456 789 --force
+        asa keywords delete 789 --campaign 123 --ad-group 456
+        asa keywords delete 789 --campaign 123 -g 456 --force
     """
     client = get_client()
 
@@ -344,7 +395,7 @@ def delete_keyword(
 
     except AppleSearchAdsError as e:
         handle_api_error(e)
-        raise typer.Exit(1) from None
+        raise typer.Exit(EXIT_ERROR) from None
 
 
 # Negative keywords subcommand
@@ -360,10 +411,13 @@ NEGATIVE_KEYWORD_COLUMN_LABELS = {
 
 @negatives_app.command("list")
 def list_negatives(
-    campaign_id: Annotated[int, typer.Argument(help="Campaign ID")],
+    campaign_id: Annotated[
+        int,
+        typer.Option("--campaign", help="Campaign ID"),
+    ],
     ad_group_id: Annotated[
         int | None,
-        typer.Option("--ad-group", "-a", help="Ad Group ID (for ad group level negatives)"),
+        typer.Option("--ad-group", "-g", help="Ad Group ID (for ad group level negatives)"),
     ] = None,
     limit: Annotated[
         int,
@@ -377,8 +431,8 @@ def list_negatives(
     """List negative keywords.
 
     Examples:
-        asa keywords negatives list 123                 # Campaign level
-        asa keywords negatives list 123 --ad-group 456  # Ad group level
+        asa keywords negatives list --campaign 123                  # Campaign level
+        asa keywords negatives list --campaign 123 --ad-group 456   # Ad group level
     """
     client = get_client()
 
@@ -415,16 +469,19 @@ def list_negatives(
 
     except AppleSearchAdsError as e:
         handle_api_error(e)
-        raise typer.Exit(1) from None
+        raise typer.Exit(EXIT_ERROR) from None
 
 
 @negatives_app.command("add")
 def add_negative(
-    campaign_id: Annotated[int, typer.Argument(help="Campaign ID")],
     text: Annotated[str, typer.Argument(help="Keyword text to exclude")],
+    campaign_id: Annotated[
+        int,
+        typer.Option("--campaign", help="Campaign ID"),
+    ],
     ad_group_id: Annotated[
         int | None,
-        typer.Option("--ad-group", "-a", help="Ad Group ID (for ad group level negative)"),
+        typer.Option("--ad-group", "-g", help="Ad Group ID (for ad group level negative)"),
     ] = None,
     match_type: Annotated[
         KeywordMatchType,
@@ -434,9 +491,9 @@ def add_negative(
     """Add a negative keyword.
 
     Examples:
-        asa keywords negatives add 123 "free"                    # Campaign level
-        asa keywords negatives add 123 "cheap" --ad-group 456    # Ad group level
-        asa keywords negatives add 123 "competitor" --match-type BROAD
+        asa keywords negatives add "free" --campaign 123                     # Campaign level
+        asa keywords negatives add "cheap" --campaign 123 --ad-group 456     # Ad group level
+        asa keywords negatives add "competitor" --campaign 123 --match-type BROAD
     """
     client = get_client()
 
@@ -465,19 +522,26 @@ def add_negative(
                     "Match Type": negative.match_type.value,
                 },
             )
+            hint_args = f"--campaign {campaign_id}"
+            if ad_group_id:
+                hint_args += f" --ad-group {ad_group_id}"
+            print_hint(f"asa keywords negatives list {hint_args}")
 
     except AppleSearchAdsError as e:
         handle_api_error(e)
-        raise typer.Exit(1) from None
+        raise typer.Exit(EXIT_ERROR) from None
 
 
 @negatives_app.command("delete")
 def delete_negative(
-    campaign_id: Annotated[int, typer.Argument(help="Campaign ID")],
     keyword_id: Annotated[int, typer.Argument(help="Negative keyword ID to delete")],
+    campaign_id: Annotated[
+        int,
+        typer.Option("--campaign", help="Campaign ID"),
+    ],
     ad_group_id: Annotated[
         int | None,
-        typer.Option("--ad-group", "-a", help="Ad Group ID (for ad group level negative)"),
+        typer.Option("--ad-group", "-g", help="Ad Group ID (for ad group level negative)"),
     ] = None,
     force: Annotated[
         bool,
@@ -487,8 +551,8 @@ def delete_negative(
     """Delete a negative keyword.
 
     Examples:
-        asa keywords negatives delete 123 789                  # Campaign level
-        asa keywords negatives delete 123 789 --ad-group 456   # Ad group level
+        asa keywords negatives delete 789 --campaign 123                   # Campaign level
+        asa keywords negatives delete 789 --campaign 123 --ad-group 456    # Ad group level
     """
     client = get_client()
 
@@ -511,4 +575,4 @@ def delete_negative(
 
     except AppleSearchAdsError as e:
         handle_api_error(e)
-        raise typer.Exit(1) from None
+        raise typer.Exit(EXIT_ERROR) from None
