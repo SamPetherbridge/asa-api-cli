@@ -219,7 +219,7 @@ async def translate_keywords(
     prompt = f"""Translate the following keywords from {source_name} to {target_name}.
 
 Keywords to translate:
-{chr(10).join(f'- {kw}' for kw in keywords)}
+{chr(10).join(f"- {kw}" for kw in keywords)}
 
 Provide translations for each keyword."""
 

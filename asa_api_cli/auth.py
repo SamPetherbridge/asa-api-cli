@@ -103,7 +103,7 @@ def test_auth(
 
     if settings.private_key and not settings.private_key_path:
         print_warning(
-            "ASA_PRIVATE_KEY env var is deprecated. " "Use ASA_PRIVATE_KEY_PATH to reference a key file instead."
+            "ASA_PRIVATE_KEY env var is deprecated. Use ASA_PRIVATE_KEY_PATH to reference a key file instead."
         )
         error_console.print()
 
@@ -190,7 +190,7 @@ def show_config(
         if settings.private_key and not settings.private_key_path:
             error_console.print()
             print_warning(
-                "ASA_PRIVATE_KEY env var is deprecated. " "Use ASA_PRIVATE_KEY_PATH to reference a key file instead."
+                "ASA_PRIVATE_KEY env var is deprecated. Use ASA_PRIVATE_KEY_PATH to reference a key file instead."
             )
 
     except ValidationError as e:

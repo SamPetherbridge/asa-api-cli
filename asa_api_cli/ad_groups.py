@@ -813,7 +813,7 @@ def review_negatives(
                 console.print(Rule("Overlapping Broad Keywords"))
                 console.print()
                 console.print(
-                    "[dim]These keywords exist as BROAD match in multiple ad groups " "(may cause competition):[/dim]"
+                    "[dim]These keywords exist as BROAD match in multiple ad groups (may cause competition):[/dim]"
                 )
                 console.print()
 
