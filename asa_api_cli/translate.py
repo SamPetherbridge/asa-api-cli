@@ -23,6 +23,7 @@ from asa_api_client.models import (
 )
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent
+from pydantic_ai.models import Model
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from rich.rule import Rule
 from rich.table import Table
@@ -159,6 +160,7 @@ def get_translation_agent(
     # Use provided provider or fall back to settings default
     active_provider = provider or settings.translate_provider
 
+    model: Model
     if active_provider == "anthropic":
         if not settings.anthropic_api_key:
             raise RuntimeError(
@@ -168,8 +170,7 @@ def get_translation_agent(
         from pydantic_ai.models.anthropic import AnthropicModel
         from pydantic_ai.providers.anthropic import AnthropicProvider
 
-        model_provider = AnthropicProvider(api_key=settings.anthropic_api_key)
-        model = AnthropicModel("claude-sonnet-4-5", provider=model_provider)
+        model = AnthropicModel("claude-sonnet-4-5", provider=AnthropicProvider(api_key=settings.anthropic_api_key))
 
     elif active_provider == "gemini":
         if not settings.gemini_api_key:
@@ -180,8 +181,7 @@ def get_translation_agent(
         from pydantic_ai.models.google import GoogleModel
         from pydantic_ai.providers.google import GoogleProvider
 
-        model_provider = GoogleProvider(api_key=settings.gemini_api_key)
-        model = GoogleModel("gemini-2.0-flash", provider=model_provider)
+        model = GoogleModel("gemini-2.0-flash", provider=GoogleProvider(api_key=settings.gemini_api_key))
     else:
         raise ValueError(f"Unknown translation provider: {active_provider}")
 
