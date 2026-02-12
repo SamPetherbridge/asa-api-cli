@@ -27,6 +27,7 @@ from asa_api_client.models import (
 from rich.table import Table
 
 from asa_api_cli.utils import (
+    EXIT_ERROR,
     console,
     enum_value,
     get_client,
@@ -340,7 +341,7 @@ def check_bid_discrepancies(
 
     except AppleSearchAdsError as e:
         handle_api_error(e)
-        raise typer.Exit(1) from None
+        raise typer.Exit(EXIT_ERROR) from None
 
 
 @dataclass
@@ -638,7 +639,7 @@ def expand_campaign(
                             source_campaign_data.append(campaign)
                         except AppleSearchAdsError as e:
                             print_error("Error", f"Could not load campaign {campaign_id}: {e.message}")
-                            raise typer.Exit(1) from None
+                            raise typer.Exit(EXIT_ERROR) from None
             else:
                 # Interactive: show all campaigns and let user select
                 with spinner("Loading campaigns..."):
@@ -652,7 +653,7 @@ def expand_campaign(
 
             if not source_campaign_data:
                 print_error("Error", "No campaigns selected")
-                raise typer.Exit(1)
+                raise typer.Exit(EXIT_ERROR)
 
             # Display selected source campaigns
             console.print()
@@ -719,7 +720,7 @@ def expand_campaign(
 
             if not keyword_bids:
                 print_error("Error", "No keywords with impressions found in last 90 days")
-                raise typer.Exit(1)
+                raise typer.Exit(EXIT_ERROR)
 
             total_impressions = sum(keyword_impressions.values())
             print_info(f"Found {len(keyword_bids)} keywords with {total_impressions:,} impressions in last 90 days")
@@ -959,7 +960,7 @@ def expand_campaign(
 
     except AppleSearchAdsError as e:
         handle_api_error(e)
-        raise typer.Exit(1) from None
+        raise typer.Exit(EXIT_ERROR) from None
 
 
 @dataclass
@@ -1452,4 +1453,534 @@ def review_keyword_bids(
 
     except AppleSearchAdsError as e:
         handle_api_error(e)
-        raise typer.Exit(1) from None
+        raise typer.Exit(EXIT_ERROR) from None
+
+
+@dataclass
+class CpaCapAnalysis:
+    """Analysis of CPA cap impact on ad group delivery."""
+
+    campaign_id: int
+    campaign_name: str
+    ad_group_id: int
+    ad_group_name: str
+    cpa_goal: Decimal
+    avg_cpa: Decimal | None
+    currency: str
+    impressions_7d: int
+    impressions_30d: int
+    taps_7d: int
+    taps_30d: int
+    installs_30d: int
+    spend_30d: Decimal
+    country: str
+
+    @property
+    def cpa_utilization(self) -> float | None:
+        """Percentage of CPA goal utilized (avg_cpa / cpa_goal * 100)."""
+        if self.avg_cpa is None or self.cpa_goal == 0:
+            return None
+        return float(self.avg_cpa / self.cpa_goal * 100)
+
+    @property
+    def impact_level(self) -> str:
+        """Estimate impact level of CPA cap on delivery.
+
+        - BLOCKED: No impressions at all - CPA goal likely blocking delivery
+        - CRITICAL: CPA >= 95% of goal - likely severely limited
+        - HIGH: CPA 85-95% of goal - probably limited
+        - MODERATE: CPA 70-85% of goal - may be slightly limited
+        - LOW: CPA < 70% of goal - unlikely to be limited
+        """
+        # If no impressions in 30 days, CPA goal is likely blocking delivery
+        if self.impressions_30d == 0:
+            return "BLOCKED"
+
+        util = self.cpa_utilization
+        if util is None:
+            return "UNKNOWN"
+
+        if util >= 95:
+            return "CRITICAL"
+        elif util >= 85:
+            return "HIGH"
+        elif util >= 70:
+            return "MODERATE"
+        else:
+            return "LOW"
+
+    @property
+    def recommendation(self) -> str:
+        """Suggest action based on CPA cap impact."""
+        level = self.impact_level
+        if level == "BLOCKED":
+            return "Remove CPA goal - blocking all delivery"
+        elif level == "CRITICAL":
+            return "Increase CPA goal or reduce bids"
+        elif level == "HIGH":
+            return "Consider increasing CPA goal"
+        elif level == "MODERATE":
+            return "Monitor - may become limited"
+        elif level == "LOW":
+            return "CPA cap not limiting delivery"
+        return "Need more conversion data"
+
+
+@app.command("cpa-impact")
+def analyze_cpa_cap_impact(
+    country: Annotated[
+        str | None,
+        typer.Option("--country", "-c", help="Filter by country code"),
+    ] = None,
+    min_installs: Annotated[
+        int,
+        typer.Option("--min-installs", help="Minimum installs to include in analysis"),
+    ] = 0,
+    critical_only: Annotated[
+        bool,
+        typer.Option("--critical", help="Only show ad groups with critical/high/blocked CPA impact"),
+    ] = False,
+    interactive: Annotated[
+        bool,
+        typer.Option("--interactive", "-i", help="Interactive mode to remove CPA goals"),
+    ] = False,
+    output: Annotated[
+        str | None,
+        typer.Option("--output", "-o", help="Export to CSV file"),
+    ] = None,
+) -> None:
+    """Analyze whether CPA caps are limiting ad group delivery.
+
+    Compares each ad group's actual average CPA against its CPA goal to identify
+    where CPA caps may be causing reduced delivery. Shows both 7-day and 30-day
+    impression data to help identify delivery issues.
+
+    Impact levels:
+    - BLOCKED: No impressions - CPA goal is completely blocking delivery
+    - CRITICAL (≥95% of goal): Likely severely limited by CPA cap
+    - HIGH (85-95%): Probably experiencing delivery limitations
+    - MODERATE (70-85%): May be slightly limited during peak times
+    - LOW (<70%): CPA cap unlikely to be limiting delivery
+
+    Examples:
+        asa optimize cpa-impact                    # Analyze all ad groups
+        asa optimize cpa-impact --country US       # Filter to US campaigns
+        asa optimize cpa-impact --critical         # Only show problem ad groups
+        asa optimize cpa-impact --interactive      # Interactively remove CPA goals
+        asa optimize cpa-impact -o cpa-analysis.csv
+    """
+    client = get_client()
+
+    end_date = date.today() - timedelta(days=1)
+    start_date_30d = end_date - timedelta(days=30)
+    start_date_7d = end_date - timedelta(days=7)
+
+    try:
+        with client:
+            # Get enabled campaigns
+            with spinner("Loading campaigns..."):
+                campaigns = list(client.campaigns.find(Selector().where("status", "==", "ENABLED")))
+
+            if country:
+                country = country.upper()
+                campaigns = [c for c in campaigns if country in [cc.upper() for cc in c.countries_or_regions]]
+
+            if not campaigns:
+                print_warning("No enabled campaigns found" + (f" for {country}" if country else ""))
+                return
+
+            print_info(f"Analyzing {len(campaigns)} campaigns for CPA cap impact...")
+
+            # Collect ad groups with CPA goals and their performance
+            cpa_analyses: list[CpaCapAnalysis] = []
+            ad_groups_with_goals = 0
+            ad_groups_without_goals = 0
+
+            for campaign in campaigns:
+                campaign_country = campaign.countries_or_regions[0] if campaign.countries_or_regions else "?"
+
+                with spinner(f"Analyzing {campaign.name[:40]}..."):
+                    try:
+                        # Get ad groups for this campaign
+                        ad_groups = list(
+                            client.campaigns(campaign.id).ad_groups.find(Selector().where("status", "==", "ENABLED"))
+                        )
+
+                        # Filter to ad groups with CPA goals
+                        ad_groups_with_cpa = []
+                        for ag in ad_groups:
+                            if ag.cpa_goal and ag.cpa_goal.amount:
+                                ad_groups_with_cpa.append(ag)
+                                ad_groups_with_goals += 1
+                            else:
+                                ad_groups_without_goals += 1
+
+                        if not ad_groups_with_cpa:
+                            continue
+
+                        # Get 30-day ad group performance report
+                        report_30d = client.reports.ad_groups(
+                            campaign_id=campaign.id,
+                            start_date=start_date_30d,
+                            end_date=end_date,
+                            granularity=GranularityType.DAILY,
+                        )
+
+                        # Get 7-day ad group performance report
+                        report_7d = client.reports.ad_groups(
+                            campaign_id=campaign.id,
+                            start_date=start_date_7d,
+                            end_date=end_date,
+                            granularity=GranularityType.DAILY,
+                        )
+
+                        # Build maps of ad group performance for both periods
+                        def aggregate_report(report: Any) -> dict[int, dict[str, Any]]:
+                            perf: dict[int, dict[str, Any]] = {}
+                            for row in report.row:
+                                if row.metadata.ad_group_id and row.total:
+                                    ag_id = row.metadata.ad_group_id
+                                    if ag_id not in perf:
+                                        perf[ag_id] = {
+                                            "impressions": 0,
+                                            "taps": 0,
+                                            "installs": 0,
+                                            "spend": Decimal("0"),
+                                            "currency": "USD",
+                                        }
+                                    perf[ag_id]["impressions"] += row.total.impressions or 0
+                                    perf[ag_id]["taps"] += row.total.taps or 0
+                                    perf[ag_id]["installs"] += row.total.installs or 0
+                                    if row.total.local_spend:
+                                        perf[ag_id]["spend"] += Decimal(str(row.total.local_spend.amount))
+                                        perf[ag_id]["currency"] = row.total.local_spend.currency
+                            return perf
+
+                        ag_perf_30d = aggregate_report(report_30d)
+                        ag_perf_7d = aggregate_report(report_7d)
+
+                        # Analyze each ad group with a CPA goal
+                        for ag in ad_groups_with_cpa:
+                            perf_30d = ag_perf_30d.get(ag.id, {})
+                            perf_7d = ag_perf_7d.get(ag.id, {})
+
+                            impressions_30d = perf_30d.get("impressions", 0)
+                            impressions_7d = perf_7d.get("impressions", 0)
+                            taps_30d = perf_30d.get("taps", 0)
+                            taps_7d = perf_7d.get("taps", 0)
+                            installs_30d = perf_30d.get("installs", 0)
+                            spend_30d = perf_30d.get("spend", Decimal("0"))
+                            currency = perf_30d.get("currency", "USD")
+
+                            # Parse CPA goal
+                            cpa_goal_amount = ag.cpa_goal.amount
+                            if hasattr(cpa_goal_amount, "amount"):
+                                # Money object
+                                cpa_goal = Decimal(str(cpa_goal_amount.amount))
+                            else:
+                                # Direct string/number
+                                cpa_goal = Decimal(str(cpa_goal_amount))
+
+                            # Calculate actual CPA
+                            avg_cpa = None
+                            if installs_30d > 0 and spend_30d > 0:
+                                avg_cpa = spend_30d / installs_30d
+
+                            cpa_analyses.append(
+                                CpaCapAnalysis(
+                                    campaign_id=campaign.id,
+                                    campaign_name=campaign.name,
+                                    ad_group_id=ag.id,
+                                    ad_group_name=ag.name,
+                                    cpa_goal=cpa_goal,
+                                    avg_cpa=avg_cpa,
+                                    currency=currency,
+                                    impressions_7d=impressions_7d,
+                                    impressions_30d=impressions_30d,
+                                    taps_7d=taps_7d,
+                                    taps_30d=taps_30d,
+                                    installs_30d=installs_30d,
+                                    spend_30d=spend_30d,
+                                    country=campaign_country,
+                                )
+                            )
+
+                    except AppleSearchAdsError:
+                        continue
+
+            if not cpa_analyses:
+                print_warning("No ad groups with CPA goals found")
+                console.print(f"\n[dim]Ad groups scanned: {ad_groups_without_goals} (none had CPA goals set)[/dim]")
+                return
+
+            # Filter by minimum installs
+            if min_installs > 0:
+                cpa_analyses = [a for a in cpa_analyses if a.installs_30d >= min_installs]
+
+                if not cpa_analyses:
+                    print_warning(f"No ad groups with CPA goals have at least {min_installs} installs")
+                    return
+
+            # Filter to critical/high/blocked only if requested
+            if critical_only:
+                cpa_analyses = [a for a in cpa_analyses if a.impact_level in ("BLOCKED", "CRITICAL", "HIGH")]
+                if not cpa_analyses:
+                    print_success("No ad groups with critical, high, or blocked CPA cap impact")
+                    return
+
+            # Sort by impact level (BLOCKED first, then by CPA utilization)
+            impact_order = {"BLOCKED": 0, "CRITICAL": 1, "HIGH": 2, "UNKNOWN": 3, "MODERATE": 4, "LOW": 5}
+            cpa_analyses.sort(key=lambda a: (impact_order.get(a.impact_level, 99), -(a.cpa_utilization or 0)))
+
+            # Export to CSV if requested
+            if output:
+                try:
+                    import csv
+
+                    with open(output, "w", newline="") as f:
+                        writer = csv.writer(f)
+                        writer.writerow(
+                            [
+                                "campaign_name",
+                                "ad_group_name",
+                                "country",
+                                "cpa_goal",
+                                "avg_cpa",
+                                "cpa_utilization_pct",
+                                "impact_level",
+                                "impressions_7d",
+                                "impressions_30d",
+                                "taps_7d",
+                                "taps_30d",
+                                "installs_30d",
+                                "spend_30d",
+                                "currency",
+                                "recommendation",
+                            ]
+                        )
+                        for a in cpa_analyses:
+                            writer.writerow(
+                                [
+                                    a.campaign_name,
+                                    a.ad_group_name,
+                                    a.country,
+                                    f"{a.cpa_goal:.2f}",
+                                    f"{a.avg_cpa:.2f}" if a.avg_cpa else "",
+                                    f"{a.cpa_utilization:.1f}" if a.cpa_utilization else "",
+                                    a.impact_level,
+                                    a.impressions_7d,
+                                    a.impressions_30d,
+                                    a.taps_7d,
+                                    a.taps_30d,
+                                    a.installs_30d,
+                                    f"{a.spend_30d:.2f}",
+                                    a.currency,
+                                    a.recommendation,
+                                ]
+                            )
+                    print_success(f"Exported {len(cpa_analyses)} ad groups to {output}")
+                except Exception as e:
+                    print_error("Export failed", str(e))
+
+            # Display results table
+            console.print()
+            table = Table(title="CPA Cap Impact Analysis")
+            table.add_column("Ad Group", style="cyan", max_width=22)
+            table.add_column("Campaign", style="magenta", max_width=18)
+            table.add_column("CPA Goal", justify="right", width=8)
+            table.add_column("Avg CPA", justify="right", width=8)
+            table.add_column("Impr 7d", justify="right", width=8)
+            table.add_column("Impr 30d", justify="right", width=9)
+            table.add_column("Taps 30d", justify="right", width=8)
+            table.add_column("Impact", justify="center", width=10)
+
+            for a in cpa_analyses[:50]:  # Limit display
+                # Color code impact level
+                impact = a.impact_level
+                if impact == "BLOCKED":
+                    impact_display = "[red bold]BLOCKED[/red bold]"
+                elif impact == "CRITICAL":
+                    impact_display = "[red bold]CRITICAL[/red bold]"
+                elif impact == "HIGH":
+                    impact_display = "[red]HIGH[/red]"
+                elif impact == "MODERATE":
+                    impact_display = "[yellow]MODERATE[/yellow]"
+                elif impact == "LOW":
+                    impact_display = "[green]LOW[/green]"
+                else:
+                    impact_display = "[dim]?[/dim]"
+
+                avg_cpa_display = f"{a.avg_cpa:.2f}" if a.avg_cpa else "—"
+
+                # Color code impressions (red if zero)
+                impr_7d = "[red]0[/red]" if a.impressions_7d == 0 else f"{a.impressions_7d:,}"
+                impr_30d = "[red]0[/red]" if a.impressions_30d == 0 else f"{a.impressions_30d:,}"
+
+                table.add_row(
+                    a.ad_group_name[:22],
+                    a.campaign_name[:18],
+                    f"{a.cpa_goal:.2f}",
+                    avg_cpa_display,
+                    impr_7d,
+                    impr_30d,
+                    f"{a.taps_30d:,}",
+                    impact_display,
+                )
+
+            console.print(table)
+
+            if len(cpa_analyses) > 50:
+                print_info(f"Showing 50 of {len(cpa_analyses)} ad groups. Use --output to export all.")
+
+            # Summary
+            blocked = sum(1 for a in cpa_analyses if a.impact_level == "BLOCKED")
+            critical = sum(1 for a in cpa_analyses if a.impact_level == "CRITICAL")
+            high = sum(1 for a in cpa_analyses if a.impact_level == "HIGH")
+            moderate = sum(1 for a in cpa_analyses if a.impact_level == "MODERATE")
+            low = sum(1 for a in cpa_analyses if a.impact_level == "LOW")
+            unknown = sum(1 for a in cpa_analyses if a.impact_level == "UNKNOWN")
+
+            console.print()
+            console.print("[bold]CPA Cap Impact Summary:[/bold]")
+            if blocked > 0:
+                console.print(f"  [red bold]Blocked (0 impressions):[/red bold] {blocked}")
+            console.print(f"  [red bold]Critical:[/red bold] {critical}")
+            console.print(f"  [red]High:[/red] {high}")
+            console.print(f"  [yellow]Moderate:[/yellow] {moderate}")
+            console.print(f"  [green]Low:[/green] {low}")
+            if unknown > 0:
+                console.print(f"  [dim]Unknown (no conversions):[/dim] {unknown}")
+
+            console.print()
+            console.print(f"[dim]Ad groups with CPA goals: {ad_groups_with_goals}[/dim]")
+            console.print(f"[dim]Ad groups without CPA goals: {ad_groups_without_goals}[/dim]")
+
+            if blocked + critical + high > 0:
+                console.print()
+                print_warning(f"{blocked + critical + high} ad groups are likely being limited by their CPA caps.")
+                if blocked > 0:
+                    console.print(
+                        f"[yellow]  {blocked} ad groups have 0 impressions - consider removing CPA goals[/yellow]"
+                    )
+
+            # Interactive mode to remove CPA goals
+            if interactive:
+                # Filter to blocked/critical/high ad groups for interactive removal
+                problem_groups = [a for a in cpa_analyses if a.impact_level in ("BLOCKED", "CRITICAL", "HIGH")]
+
+                if not problem_groups:
+                    print_info("No problem ad groups to process")
+                    return
+
+                console.print()
+                console.rule("[bold]Interactive CPA Goal Management")
+                console.print()
+                console.print("[dim]For each ad group, choose an action:[/dim]")
+                console.print("[dim]  • 'r' or 'remove' - Remove CPA goal[/dim]")
+                console.print("[dim]  • 'i' or 'increase' - Increase CPA goal (enter new value)[/dim]")
+                console.print("[dim]  • 's' or 'skip' - Skip this ad group[/dim]")
+                console.print("[dim]  • 'q' or 'quit' - Stop processing[/dim]")
+                console.print()
+
+                changes_made = 0
+                for i, ag in enumerate(problem_groups, 1):
+                    console.rule(f"[bold]{i}/{len(problem_groups)}")
+                    console.print()
+
+                    # Show ad group details
+                    impact_color = "red" if ag.impact_level in ("BLOCKED", "CRITICAL") else "yellow"
+                    console.print(f"[bold]Ad Group:[/bold] {ag.ad_group_name}")
+                    console.print(f"[bold]Campaign:[/bold] {ag.campaign_name} ({ag.country})")
+                    console.print()
+                    cpa_str = f"{ag.cpa_goal:.2f} {ag.currency}"
+                    console.print(f"  CPA Goal:        [{impact_color}]{cpa_str}[/{impact_color}]")
+                    if ag.avg_cpa:
+                        console.print(f"  Actual Avg CPA:  {ag.avg_cpa:.2f} {ag.currency}")
+                    console.print(f"  Impressions 7d:  {ag.impressions_7d:,}")
+                    console.print(f"  Impressions 30d: {ag.impressions_30d:,}")
+                    console.print(f"  Taps 30d:        {ag.taps_30d:,}")
+                    console.print(f"  Installs 30d:    {ag.installs_30d:,}")
+                    console.print(f"  Impact:          [{impact_color}]{ag.impact_level}[/{impact_color}]")
+                    console.print()
+
+                    action = (
+                        typer.prompt(
+                            "Action",
+                            default="skip",
+                            show_default=True,
+                        )
+                        .strip()
+                        .lower()
+                    )
+
+                    if action in ("q", "quit"):
+                        print_info("Quitting...")
+                        break
+                    elif action in ("s", "skip", ""):
+                        console.print("[dim]Skipped[/dim]")
+                        console.print()
+                        continue
+                    elif action in ("r", "remove"):
+                        # Remove CPA goal by setting it to None
+                        try:
+                            with spinner("Removing CPA goal..."):
+                                # Update ad group with cpa_goal set to remove it
+                                # Note: The API may require a specific way to clear the CPA goal
+                                client.campaigns(ag.campaign_id).ad_groups.update(
+                                    ag.ad_group_id,
+                                    AdGroupUpdate(cpa_goal=None),
+                                )
+                            print_success(f"Removed CPA goal from '{ag.ad_group_name}'")
+                            changes_made += 1
+                        except AppleSearchAdsError as e:
+                            print_error("Failed to remove CPA goal", str(e))
+                        console.print()
+                    elif action in ("i", "increase"):
+                        # Prompt for new CPA goal
+                        suggested = ag.cpa_goal * Decimal("1.5")  # Suggest 50% increase
+                        new_goal_str = typer.prompt(
+                            f"New CPA goal ({ag.currency})",
+                            default=f"{suggested:.2f}",
+                        )
+                        try:
+                            new_goal = Decimal(new_goal_str)
+                            if new_goal <= 0:
+                                print_warning("Invalid CPA goal, skipping")
+                                continue
+
+                            with spinner("Updating CPA goal..."):
+                                from asa_api_client.models import CpaGoal as CpaGoalModel
+
+                                client.campaigns(ag.campaign_id).ad_groups.update(
+                                    ag.ad_group_id,
+                                    AdGroupUpdate(
+                                        cpa_goal=CpaGoalModel(amount=Money(amount=str(new_goal), currency=ag.currency))
+                                    ),
+                                )
+                            print_success(f"Updated CPA goal: {ag.cpa_goal:.2f} → {new_goal:.2f} {ag.currency}")
+                            changes_made += 1
+                        except ValueError:
+                            print_warning(f"Invalid input '{new_goal_str}', skipping")
+                        except AppleSearchAdsError as e:
+                            print_error("Failed to update CPA goal", str(e))
+                        console.print()
+                    else:
+                        console.print(f"[dim]Unknown action '{action}', skipping[/dim]")
+                        console.print()
+
+                # Summary
+                console.print()
+                if changes_made > 0:
+                    print_result_panel(
+                        "CPA Goal Management Complete",
+                        {
+                            "Ad groups reviewed": str(len(problem_groups)),
+                            "Changes made": str(changes_made),
+                        },
+                    )
+                else:
+                    print_info("No changes made")
+
+    except AppleSearchAdsError as e:
+        handle_api_error(e)
+        raise typer.Exit(EXIT_ERROR) from None
