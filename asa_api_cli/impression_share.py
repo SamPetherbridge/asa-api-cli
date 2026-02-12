@@ -15,6 +15,7 @@ from asa_api_client.models.reports import GranularityType, ImpressionShareReport
 from rich.table import Table
 
 from asa_api_cli.utils import (
+    EXIT_ERROR,
     console,
     get_client,
     handle_api_error,
@@ -987,7 +988,7 @@ def correlate_impression_share(
 
     except AppleSearchAdsError as e:
         handle_api_error(e)
-        raise typer.Exit(1) from None
+        raise typer.Exit(EXIT_ERROR) from None
 
 
 def _display_bid_item(item: CorrelatedSearchTerm, index: int) -> None:
@@ -1204,12 +1205,22 @@ def bid_adjust(
             if item.campaign_id and item.ad_group_id and item.keyword_id:
                 try:
                     update = KeywordUpdate(bid_amount=Money(amount=str(new_bid), currency=item.currency or "USD"))
-                    client.campaigns(item.campaign_id).ad_groups(item.ad_group_id).keywords.update_bulk(
-                        [(item.keyword_id, update)]
-                    )
+                    with client:
+                        result = (
+                            client.campaigns(item.campaign_id)
+                            .ad_groups(item.ad_group_id)
+                            .keywords.update_bulk([(item.keyword_id, update)])
+                        )
                     old_bid = item.current_bid or Decimal("0")
-                    changes_made.append((item, old_bid, new_bid))
-                    console.print(f"  [green]Updated: {item.currency or 'USD'} {old_bid:.2f} -> {new_bid:.2f}[/green]")
+                    if result.data:
+                        bid_data = result.data[0].bid_amount
+                        actual_bid = Decimal(bid_data.amount) if bid_data else new_bid
+                        changes_made.append((item, old_bid, actual_bid))
+                        console.print(
+                            f"  [green]Updated: {item.currency or 'USD'} {old_bid:.2f} -> {actual_bid:.2f}[/green]"
+                        )
+                    else:
+                        console.print("  [red]Update failed - empty response[/red]")
                 except AppleSearchAdsError as e:
                     console.print(f"  [red]Failed to update: {e}[/red]")
             else:
@@ -1231,4 +1242,4 @@ def bid_adjust(
 
     except AppleSearchAdsError as e:
         handle_api_error(e)
-        raise typer.Exit(1) from None
+        raise typer.Exit(EXIT_ERROR) from None
