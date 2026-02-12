@@ -1,8 +1,10 @@
 """Shared utilities for CLI commands."""
 
 import json
+import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import date
 from enum import Enum
 from pathlib import Path
@@ -46,6 +48,31 @@ error_console = Console(stderr=True, theme=ASA_THEME)
 
 T = TypeVar("T")
 
+# Exit codes
+EXIT_SUCCESS = 0
+EXIT_ERROR = 1
+EXIT_USAGE = 2
+
+
+@dataclass
+class CLIState:
+    """Global CLI state set by main callback flags."""
+
+    quiet: bool = False
+    verbose: bool = False
+    no_input: bool = False
+    json_output: bool = False
+
+
+cli_state = CLIState()
+
+
+def init_consoles(*, no_color: bool = False) -> None:
+    """Reinitialize consoles with updated settings."""
+    global console, error_console
+    console = Console(theme=ASA_THEME, no_color=no_color)
+    error_console = Console(stderr=True, theme=ASA_THEME, no_color=no_color)
+
 
 def enum_value(v: Enum | str | bool) -> str:
     """Get the value from an enum, string, or bool.
@@ -86,7 +113,7 @@ def get_client() -> AppleSearchAdsClient:
             "Required Environment Variables",
             "• ASA_CLIENT_ID\n• ASA_TEAM_ID\n• ASA_KEY_ID\n• ASA_ORG_ID\n• ASA_PRIVATE_KEY_PATH (or ASA_PRIVATE_KEY)",
         )
-        raise typer.Exit(1) from None
+        raise typer.Exit(EXIT_ERROR) from None
 
 
 def handle_api_error(e: AppleSearchAdsError) -> None:
@@ -138,12 +165,14 @@ def print_success(message: str, details: str | None = None) -> None:
         message: The success message.
         details: Optional additional details.
     """
+    if cli_state.quiet:
+        return
     text = Text()
     text.append("✓ ", style="success")
     text.append(message)
     if details:
         text.append(f"\n  {details}", style="muted")
-    console.print(text)
+    error_console.print(text)
 
 
 def print_error(title: str, message: str, details: str | None = None) -> None:
@@ -176,7 +205,7 @@ def print_warning(message: str) -> None:
     text = Text()
     text.append("⚠ ", style="warning")
     text.append(message, style="warning")
-    console.print(text)
+    error_console.print(text)
 
 
 def print_info(message: str) -> None:
@@ -185,10 +214,12 @@ def print_info(message: str) -> None:
     Args:
         message: The info message.
     """
+    if cli_state.quiet:
+        return
     text = Text()
     text.append("ℹ ", style="info")
     text.append(message)
-    console.print(text)
+    error_console.print(text)
 
 
 def print_info_panel(title: str, content: str) -> None:
@@ -204,7 +235,7 @@ def print_info_panel(title: str, content: str) -> None:
         border_style="cyan",
         padding=(0, 1),
     )
-    console.print(panel)
+    error_console.print(panel)
 
 
 def print_result_panel(title: str, data: dict[str, Any]) -> None:
@@ -224,7 +255,7 @@ def print_result_panel(title: str, data: dict[str, Any]) -> None:
         border_style="green",
         padding=(0, 1),
     )
-    console.print(panel)
+    error_console.print(panel)
 
 
 # ============================================================================
@@ -271,11 +302,14 @@ def print_table(
 
 
 def print_json(data: Any, title: str | None = None) -> None:
-    """Print data as syntax-highlighted JSON.
+    """Print data as JSON.
+
+    Outputs raw JSON when piped or when --json global flag is set.
+    Shows syntax-highlighted JSON in a TTY.
 
     Args:
         data: Data to print as JSON.
-        title: Optional title to display above the JSON.
+        title: Optional title to display above the JSON (TTY only).
     """
     if hasattr(data, "model_dump"):
         data = data.model_dump(by_alias=True, exclude_none=True)
@@ -284,19 +318,22 @@ def print_json(data: Any, title: str | None = None) -> None:
 
     json_str = json.dumps(data, indent=2, default=str)
 
-    syntax = Syntax(
-        json_str,
-        "json",
-        theme="monokai",
-        line_numbers=False,
-        word_wrap=True,
-    )
-
-    if title:
-        panel = Panel(syntax, title=f"[info]{title}[/info]", border_style="cyan")
-        console.print(panel)
+    if not console.is_terminal or cli_state.json_output:
+        sys.stdout.write(json_str + "\n")
     else:
-        console.print(syntax)
+        syntax = Syntax(
+            json_str,
+            "json",
+            theme="monokai",
+            line_numbers=False,
+            word_wrap=True,
+        )
+
+        if title:
+            panel = Panel(syntax, title=f"[info]{title}[/info]", border_style="cyan")
+            console.print(panel)
+        else:
+            console.print(syntax)
 
 
 def print_csv(data: list[dict[str, Any]], columns: list[str]) -> None:
@@ -307,7 +344,6 @@ def print_csv(data: list[dict[str, Any]], columns: list[str]) -> None:
         columns: Column names to include.
     """
     import csv
-    import sys
 
     writer = csv.DictWriter(sys.stdout, fieldnames=columns, extrasaction="ignore")
     writer.writeheader()
@@ -323,6 +359,8 @@ def output_data(
 ) -> None:
     """Output data in the specified format.
 
+    Global --json flag overrides the format to JSON.
+
     Args:
         data: Data to output.
         columns: Column names for table/CSV output.
@@ -330,6 +368,8 @@ def output_data(
         title: Optional title for table output.
         column_labels: Optional mapping of column names to display labels.
     """
+    if cli_state.json_output:
+        format = OutputFormat.JSON
     if format == OutputFormat.JSON:
         print_json(data, title)
     elif format == OutputFormat.CSV:
@@ -357,7 +397,10 @@ def spinner(message: str) -> Iterator[None]:
         with spinner("Loading campaigns..."):
             campaigns = client.campaigns.list()
     """
-    with console.status(f"[info]{message}[/info]", spinner="dots"):
+    if cli_state.quiet or not error_console.is_terminal:
+        yield
+        return
+    with error_console.status(f"[info]{message}[/info]", spinner="dots"):
         yield
 
 
@@ -379,7 +422,7 @@ def create_progress() -> Progress:
         BarColumn(),
         TaskProgressColumn(),
         TimeElapsedColumn(),
-        console=console,
+        console=error_console,
     )
 
 
@@ -402,6 +445,9 @@ def iterate_with_progress(
         for campaign in iterate_with_progress(client.campaigns.iter_all(), total=100):
             process(campaign)
     """
+    if cli_state.quiet or not error_console.is_terminal:
+        yield from items
+        return
     with create_progress() as progress:
         task = progress.add_task(description, total=total)
         for item in items:
@@ -493,6 +539,9 @@ def format_percent(value: float | None) -> str:
 def confirm_action(message: str, default: bool = False) -> bool:
     """Ask for confirmation with styled prompt.
 
+    When --no-input is set, refuses to prompt and exits with an error
+    suggesting --force.
+
     Args:
         message: Confirmation message.
         default: Default value if user just presses Enter.
@@ -500,4 +549,22 @@ def confirm_action(message: str, default: bool = False) -> bool:
     Returns:
         True if confirmed, False otherwise.
     """
+    if cli_state.no_input:
+        print_error(
+            "Input required",
+            f"Confirmation needed: {message}",
+            details="Use --force to skip confirmations in non-interactive mode.",
+        )
+        raise typer.Exit(EXIT_ERROR)
     return typer.confirm(message, default=default)
+
+
+def print_hint(command: str) -> None:
+    """Print a hint suggesting the next command.
+
+    Args:
+        command: The suggested command to run next.
+    """
+    if cli_state.quiet:
+        return
+    error_console.print(f"[muted]  Hint: {command}[/muted]")
