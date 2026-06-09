@@ -50,9 +50,14 @@ app.add_typer(translate.app, name="translate", help="Translate keywords to multi
 def version_callback(value: bool) -> None:
     """Show version and exit."""
     if value:
-        from asa_api_client import __version__ as api_version
+        from importlib.metadata import PackageNotFoundError, version
 
         from asa_api_cli import __version__ as cli_version
+
+        try:
+            api_version = version("asa-api-client")
+        except PackageNotFoundError:  # pragma: no cover
+            api_version = "unknown"
 
         print(f"asa-api-cli {cli_version} (asa-api-client {api_version})")
         raise typer.Exit()
