@@ -10,6 +10,7 @@ from asa_api_cli import (
     apps,
     auth,
     brand,
+    budget_orders,
     campaigns,
     countries,
     geo,
@@ -39,6 +40,7 @@ app.add_typer(product_pages.app, name="product-pages", help="View custom product
 app.add_typer(apps.app, name="apps", help="Search the App Store for advertisable apps")
 app.add_typer(geo.app, name="geo", help="Search geographic locations for targeting")
 app.add_typer(countries.app, name="countries", help="List supported countries and regions")
+app.add_typer(budget_orders.app, name="budget-orders", help="View budget orders")
 app.add_typer(reports.app, name="reports", help="Generate reports")
 app.add_typer(optimize.app, name="optimize", help="Optimization tools")
 app.add_typer(impression_share.app, name="impression-share", help="Impression share analysis")
