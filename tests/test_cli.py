@@ -76,6 +76,51 @@ def test_ads_help() -> None:
     assert result.exit_code == 0
     assert "list" in result.stdout
     assert "get" in result.stdout
+    assert "create" in result.stdout
+    assert "update" in result.stdout
+    assert "delete" in result.stdout
+
+
+def test_ads_create_creative_set_rejected() -> None:
+    """CREATIVE_SET is not supported by the create command (no asset selection)."""
+    result = runner.invoke(
+        app,
+        ["ads", "create", "-c", "1", "-a", "2", "-n", "x", "-t", "CREATIVE_SET"],
+    )
+    assert result.exit_code != 0
+
+
+def test_ads_create_custom_page_requires_product_page() -> None:
+    """CUSTOM_PRODUCT_PAGE without --product-page should fail before any API call."""
+    result = runner.invoke(
+        app,
+        ["ads", "create", "-c", "1", "-a", "2", "-n", "x", "-t", "CUSTOM_PRODUCT_PAGE"],
+    )
+    assert result.exit_code != 0
+
+
+def test_ads_create_default_page_rejects_product_page() -> None:
+    """DEFAULT_PRODUCT_PAGE must not be given a --product-page."""
+    result = runner.invoke(
+        app,
+        ["ads", "create", "-c", "1", "-a", "2", "-n", "x", "-t", "DEFAULT_PRODUCT_PAGE", "-p", "pp1"],
+    )
+    assert result.exit_code != 0
+
+
+def test_ads_create_dry_run_succeeds_offline() -> None:
+    """A valid --dry-run create previews the payload and exits 0 without an API call."""
+    result = runner.invoke(
+        app,
+        ["ads", "create", "-c", "1", "-a", "2", "-n", "Test ad", "-t", "DEFAULT_PRODUCT_PAGE", "--dry-run"],
+    )
+    assert result.exit_code == 0
+
+
+def test_ads_update_requires_a_field() -> None:
+    """update with neither --name nor --status should fail before any API call."""
+    result = runner.invoke(app, ["ads", "update", "789", "-c", "1", "-a", "2"])
+    assert result.exit_code != 0
 
 
 def test_product_pages_help() -> None:
