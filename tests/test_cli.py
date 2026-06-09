@@ -37,3 +37,33 @@ def test_auth_help() -> None:
     assert result.exit_code == 0
     assert "show" in result.stdout
     assert "test" in result.stdout
+
+
+def test_root_help_lists_lookup_commands() -> None:
+    """Root help should advertise the v5 lookup command groups."""
+    result = runner.invoke(app, ["--help"])
+    assert result.exit_code == 0
+    assert "apps" in result.stdout
+    assert "geo" in result.stdout
+    assert "countries" in result.stdout
+
+
+def test_apps_help() -> None:
+    """Test apps subcommand help."""
+    result = runner.invoke(app, ["apps", "--help"])
+    assert result.exit_code == 0
+    assert "search" in result.stdout
+
+
+def test_geo_help() -> None:
+    """Test geo subcommand help."""
+    result = runner.invoke(app, ["geo", "--help"])
+    assert result.exit_code == 0
+    assert "search" in result.stdout
+
+
+def test_countries_help() -> None:
+    """Test countries subcommand help."""
+    result = runner.invoke(app, ["countries", "--help"])
+    assert result.exit_code == 0
+    assert "list" in result.stdout

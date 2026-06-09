@@ -6,9 +6,12 @@ import typer
 
 from asa_api_cli import (
     ad_groups,
+    apps,
     auth,
     brand,
     campaigns,
+    countries,
+    geo,
     impression_share,
     keywords,
     optimize,
@@ -29,6 +32,9 @@ app.add_typer(brand.app, name="brand", help="Create brand protection campaigns")
 app.add_typer(campaigns.app, name="campaigns", help="Manage campaigns")
 app.add_typer(ad_groups.app, name="ad-groups", help="Manage ad groups")
 app.add_typer(keywords.app, name="keywords", help="Manage keywords")
+app.add_typer(apps.app, name="apps", help="Search the App Store for advertisable apps")
+app.add_typer(geo.app, name="geo", help="Search geographic locations for targeting")
+app.add_typer(countries.app, name="countries", help="List supported countries and regions")
 app.add_typer(reports.app, name="reports", help="Generate reports")
 app.add_typer(optimize.app, name="optimize", help="Optimization tools")
 app.add_typer(impression_share.app, name="impression-share", help="Impression share analysis")
