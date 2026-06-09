@@ -6,7 +6,8 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from decimal import Decimal
-from typing import Annotated, Any, TypeVar
+from pathlib import Path
+from typing import Annotated, Any, Literal, TypeVar
 
 import typer
 from asa_api_client.exceptions import AppleSearchAdsError, NotFoundError
@@ -24,6 +25,7 @@ from asa_api_client.models import (
     NegativeKeywordCreate,
     Selector,
 )
+from pydantic import BaseModel, Field
 from rich.table import Table
 
 from asa_api_cli.utils import (
@@ -1980,6 +1982,474 @@ def analyze_cpa_cap_impact(
                     )
                 else:
                     print_info("No changes made")
+
+    except AppleSearchAdsError as e:
+        handle_api_error(e)
+        raise typer.Exit(EXIT_ERROR) from None
+
+
+# ============================================================================
+# Negative Keyword Suggestions (AI-Powered)
+# ============================================================================
+
+
+@dataclass
+class SearchTermAnalysis:
+    """A search term with performance data for negative keyword analysis."""
+
+    search_term: str
+    campaign_id: int
+    campaign_name: str
+    ad_group_id: int
+    ad_group_name: str
+    impressions: int
+    taps: int
+    installs: int
+    spend: Decimal
+    currency: str
+    matched_keyword: str | None = None
+
+
+class NegativeSuggestion(BaseModel):  # type: ignore[misc]
+    """AI suggestion for a single search term."""
+
+    search_term: str = Field(description="The search term being evaluated")
+    action: Literal["negative", "keep", "review"] = Field(
+        description="Whether to add as negative keyword, keep, or flag for manual review"
+    )
+    reason: str = Field(description="Brief explanation for the recommendation")
+
+
+class NegativeKeywordSuggestions(BaseModel):  # type: ignore[misc]
+    """Batch of negative keyword suggestions from AI analysis."""
+
+    suggestions: list[NegativeSuggestion] = Field(description="List of suggestions for each search term")
+
+
+NEGATIVE_KEYWORD_SYSTEM_PROMPT = (
+    "You are an expert Apple Search Ads optimiser specialising in "
+    "negative keyword strategy.\n\n"
+    "You will receive a list of search terms from App Store Search Ads "
+    "campaigns along with their performance metrics and the app description.\n\n"
+    "Your job is to classify each search term as:\n"
+    '- "negative": Irrelevant to the app — add as a negative keyword to stop wasting spend.\n'
+    '- "keep": Relevant and performing well or worth testing further.\n'
+    '- "review": Ambiguous — may be relevant but performance is poor, needs human judgement.\n\n'
+    "Guidelines:\n"
+    "1. A search term is irrelevant if it clearly targets a different app, product, or intent.\n"
+    '2. High spend with zero installs over a meaningful period is a strong signal for "negative".\n'
+    "3. Low-volume terms (few impressions/taps) with no installs may just need more data "
+    '— prefer "review" over "negative" unless clearly irrelevant.\n'
+    "4. Brand names of competitors are usually worth keeping unless spend is excessive.\n"
+    '5. Generic terms tangentially related to the app deserve "review", not automatic "negative".\n'
+    "6. Consider the app context provided — what the app does and who it serves.\n"
+    '7. Be conservative: only recommend "negative" when you are confident the term is irrelevant.'
+)
+
+
+def _get_negative_analysis_agent(
+    settings: Any,
+    provider: str | None = None,
+) -> Any:
+    """Create a PydanticAI agent for negative keyword analysis."""
+    from pydantic_ai import Agent
+    from pydantic_ai.models import Model
+
+    active_provider = provider or settings.translate_provider
+
+    model: Model
+    if active_provider == "anthropic":
+        if not settings.anthropic_api_key:
+            raise RuntimeError(
+                "ANTHROPIC_API_KEY is required for AI analysis.\n"
+                "Add it to your .env file or set the environment variable."
+            )
+        from pydantic_ai.models.anthropic import AnthropicModel
+        from pydantic_ai.providers.anthropic import AnthropicProvider
+
+        model = AnthropicModel("claude-sonnet-4-5", provider=AnthropicProvider(api_key=settings.anthropic_api_key))
+    elif active_provider == "gemini":
+        if not settings.gemini_api_key:
+            raise RuntimeError(
+                "GEMINI_API_KEY is required for AI analysis.\nAdd it to your .env file or set the environment variable."
+            )
+        from pydantic_ai.models.google import GoogleModel
+        from pydantic_ai.providers.google import GoogleProvider
+
+        model = GoogleModel("gemini-2.0-flash", provider=GoogleProvider(api_key=settings.gemini_api_key))
+    else:
+        raise ValueError(f"Unknown provider: {active_provider}")
+
+    return Agent(
+        model,
+        output_type=NegativeKeywordSuggestions,
+        system_prompt=NEGATIVE_KEYWORD_SYSTEM_PROMPT,
+    )
+
+
+async def _analyse_search_terms(
+    terms: list[SearchTermAnalysis],
+    app_description: str,
+    settings: Any,
+    provider: str | None = None,
+) -> NegativeKeywordSuggestions:
+    """Send search terms to AI for negative keyword classification."""
+    agent = _get_negative_analysis_agent(settings, provider)
+
+    lines = []
+    for t in terms:
+        cpt = t.spend / t.taps if t.taps > 0 else Decimal("0")
+        lines.append(
+            f'- "{t.search_term}" | matched: "{t.matched_keyword or "?"}" '
+            f"| impr: {t.impressions} | taps: {t.taps} | installs: {t.installs} "
+            f"| spend: {t.spend:.2f} {t.currency} | CPT: {cpt:.2f}"
+        )
+
+    prompt = f"""App context: {app_description}
+
+Analyse these search terms and recommend which should be added as negative keywords:
+
+{chr(10).join(lines)}
+
+Classify each search term as "negative", "keep", or "review" with a brief reason."""
+
+    result = await agent.run(prompt)
+    return result.output  # type: ignore[no-any-return]
+
+
+@app.command("negatives")
+def negatives(
+    campaign_id: Annotated[
+        int | None,
+        typer.Option("--campaign-id", "-c", help="Analyse a single campaign (default: all campaigns)"),
+    ] = None,
+    days: Annotated[
+        int,
+        typer.Option("--days", "-d", help="Days of search term data to analyse"),
+    ] = 30,
+    min_spend: Annotated[
+        float,
+        typer.Option("--min-spend", help="Minimum spend to include a search term"),
+    ] = 0.0,
+    min_impressions: Annotated[
+        int,
+        typer.Option("--min-impressions", help="Minimum impressions to include a search term"),
+    ] = 0,
+    country: Annotated[
+        str | None,
+        typer.Option("--country", help="Filter campaigns by country code (e.g. US, GB)"),
+    ] = None,
+    provider: Annotated[
+        str | None,
+        typer.Option("--provider", "-p", help="AI provider: anthropic or gemini"),
+    ] = None,
+    env_file: Annotated[
+        Path | None,
+        typer.Option("--env-file", "-e", help="Path to .env file with API keys"),
+    ] = None,
+    apply: Annotated[
+        bool,
+        typer.Option("--apply", help="Apply suggested negatives (campaign-level exact match)"),
+    ] = False,
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", "-n", help="Show suggestions without applying changes"),
+    ] = False,
+    output: Annotated[
+        Path | None,
+        typer.Option("--output", "-o", help="Export suggestions to CSV file"),
+    ] = None,
+) -> None:
+    """Analyse search terms with AI and suggest negative keywords.
+
+    Pulls search term reports across all campaigns (or a single campaign),
+    sends performance data to an AI model for relevance classification,
+    and optionally applies the suggestions as campaign-level negative keywords.
+
+    Requires ANTHROPIC_API_KEY or GEMINI_API_KEY in environment or .env file.
+    """
+    import asyncio
+
+    from asa_api_cli.translate import get_translate_settings
+
+    try:
+        settings = get_translate_settings(env_file)
+    except Exception as e:
+        print_error("Configuration Error", str(e))
+        raise typer.Exit(EXIT_ERROR) from None
+
+    end_date = date.today()
+    start_date = end_date - timedelta(days=days)
+
+    client = get_client()
+
+    try:
+        with client:
+            # Collect campaigns to analyse
+            if campaign_id:
+                with spinner("Fetching campaign..."):
+                    campaign = client.campaigns.get(campaign_id)
+                target_campaigns = [campaign]
+            else:
+                with spinner("Loading campaigns..."):
+                    target_campaigns = list(client.campaigns.find(Selector().where("status", "==", "ENABLED")))
+
+            if country:
+                country = country.upper()
+                target_campaigns = [c for c in target_campaigns if country in (c.countries_or_regions or [])]
+
+            if not target_campaigns:
+                print_warning("No campaigns found matching filters")
+                return
+
+            print_info(f"Analysing search terms from {len(target_campaigns)} campaign(s) ({start_date} to {end_date})")
+
+            # Collect search term data across all campaigns
+            all_terms: list[SearchTermAnalysis] = []
+
+            with spinner("Pulling search term reports..."):
+                for camp in target_campaigns:
+                    try:
+                        report = client.reports.search_terms(
+                            campaign_id=camp.id,
+                            start_date=start_date,
+                            end_date=end_date,
+                            granularity=GranularityType.DAILY,
+                        )
+
+                        if not report.row:
+                            continue
+
+                        # Aggregate by (search_term, ad_group_id) across daily rows
+                        agg: dict[tuple[str, int], SearchTermAnalysis] = {}
+                        for row in report.row:
+                            if not row.total or not row.metadata.search_term_text:
+                                continue
+
+                            key = (row.metadata.search_term_text, row.metadata.ad_group_id or 0)
+
+                            if key not in agg:
+                                spend_amt = (
+                                    Decimal(str(row.total.local_spend.amount))
+                                    if row.total.local_spend
+                                    else Decimal("0")
+                                )
+                                currency = row.total.local_spend.currency if row.total.local_spend else "USD"
+                                agg[key] = SearchTermAnalysis(
+                                    search_term=row.metadata.search_term_text,
+                                    campaign_id=camp.id,
+                                    campaign_name=camp.name,
+                                    ad_group_id=row.metadata.ad_group_id or 0,
+                                    ad_group_name=row.metadata.ad_group_name or "",
+                                    impressions=row.total.impressions or 0,
+                                    taps=row.total.taps or 0,
+                                    installs=row.total.tap_installs or 0,
+                                    spend=spend_amt,
+                                    currency=currency,
+                                    matched_keyword=row.metadata.keyword,
+                                )
+                            else:
+                                existing = agg[key]
+                                existing.impressions += row.total.impressions or 0
+                                existing.taps += row.total.taps or 0
+                                existing.installs += row.total.tap_installs or 0
+                                if row.total.local_spend:
+                                    existing.spend += Decimal(str(row.total.local_spend.amount))
+
+                        all_terms.extend(agg.values())
+                    except AppleSearchAdsError:
+                        continue
+
+            if not all_terms:
+                print_warning("No search term data found for the specified period")
+                return
+
+            # Filter by thresholds
+            if min_spend > 0:
+                all_terms = [t for t in all_terms if t.spend >= Decimal(str(min_spend))]
+            if min_impressions > 0:
+                all_terms = [t for t in all_terms if t.impressions >= min_impressions]
+
+            if not all_terms:
+                print_warning("No search terms match the specified thresholds")
+                return
+
+            # Sort by spend descending to prioritise highest waste
+            all_terms.sort(key=lambda t: t.spend, reverse=True)
+
+            print_info(f"Found {len(all_terms)} search terms to analyse")
+
+            # Build app context from campaign names
+            app_names = {c.name.split(" - ")[0].strip() for c in target_campaigns}
+            app_description = f"App: {', '.join(app_names)}" if app_names else "Unknown app"
+
+            # Process in batches (AI context limits)
+            batch_size = 100
+            all_suggestions: list[tuple[SearchTermAnalysis, NegativeSuggestion]] = []
+
+            for i in range(0, len(all_terms), batch_size):
+                batch = all_terms[i : i + batch_size]
+                batch_num = i // batch_size + 1
+                total_batches = (len(all_terms) + batch_size - 1) // batch_size
+
+                with spinner(f"AI analysis batch {batch_num}/{total_batches}..."):
+                    try:
+                        result = asyncio.run(_analyse_search_terms(batch, app_description, settings, provider))
+                    except RuntimeError as e:
+                        print_error("AI Error", str(e))
+                        raise typer.Exit(EXIT_ERROR) from None
+
+                # Match suggestions back to term data
+                suggestion_map = {s.search_term: s for s in result.suggestions}
+                for term in batch:
+                    suggestion = suggestion_map.get(term.search_term)
+                    if suggestion:
+                        all_suggestions.append((term, suggestion))
+
+            if not all_suggestions:
+                print_warning("AI returned no suggestions")
+                return
+
+            # Separate by action
+            negatives_list = [(t, s) for t, s in all_suggestions if s.action == "negative"]
+            review_list = [(t, s) for t, s in all_suggestions if s.action == "review"]
+            keep_list = [(t, s) for t, s in all_suggestions if s.action == "keep"]
+
+            # Display results
+            console.print()
+
+            if negatives_list:
+                table = Table(title=f"Suggested Negatives ({len(negatives_list)})")
+                table.add_column("Search Term", style="red", max_width=30)
+                table.add_column("Campaign", style="cyan", max_width=20)
+                table.add_column("Impr", justify="right")
+                table.add_column("Taps", justify="right")
+                table.add_column("Installs", justify="right")
+                table.add_column("Spend", justify="right")
+                table.add_column("Reason", max_width=35)
+
+                for term, suggestion in negatives_list:
+                    table.add_row(
+                        term.search_term,
+                        term.campaign_name[:20],
+                        f"{term.impressions:,}",
+                        f"{term.taps:,}",
+                        f"{term.installs:,}",
+                        f"{term.spend:.2f} {term.currency}",
+                        suggestion.reason,
+                    )
+
+                console.print(table)
+                console.print()
+
+            if review_list:
+                table = Table(title=f"Needs Review ({len(review_list)})")
+                table.add_column("Search Term", style="yellow", max_width=30)
+                table.add_column("Campaign", style="cyan", max_width=20)
+                table.add_column("Impr", justify="right")
+                table.add_column("Taps", justify="right")
+                table.add_column("Installs", justify="right")
+                table.add_column("Spend", justify="right")
+                table.add_column("Reason", max_width=35)
+
+                for term, suggestion in review_list:
+                    table.add_row(
+                        term.search_term,
+                        term.campaign_name[:20],
+                        f"{term.impressions:,}",
+                        f"{term.taps:,}",
+                        f"{term.installs:,}",
+                        f"{term.spend:.2f} {term.currency}",
+                        suggestion.reason,
+                    )
+
+                console.print(table)
+                console.print()
+
+            # Summary
+            total_negative_spend = sum(t.spend for t, _ in negatives_list)
+            print_result_panel(
+                "Analysis Summary",
+                {
+                    "Search terms analysed": str(len(all_suggestions)),
+                    "Suggested negatives": str(len(negatives_list)),
+                    "Needs review": str(len(review_list)),
+                    "Keep": str(len(keep_list)),
+                    "Wasted spend (negatives)": f"{total_negative_spend:.2f}",
+                },
+            )
+
+            # Export to CSV
+            if output:
+                try:
+                    import csv
+
+                    with open(output, "w", newline="") as f:
+                        writer = csv.writer(f)
+                        writer.writerow(
+                            [
+                                "search_term",
+                                "action",
+                                "reason",
+                                "campaign_name",
+                                "ad_group_name",
+                                "matched_keyword",
+                                "impressions",
+                                "taps",
+                                "installs",
+                                "spend",
+                                "currency",
+                            ]
+                        )
+                        for term, suggestion in all_suggestions:
+                            writer.writerow(
+                                [
+                                    term.search_term,
+                                    suggestion.action,
+                                    suggestion.reason,
+                                    term.campaign_name,
+                                    term.ad_group_name,
+                                    term.matched_keyword or "",
+                                    term.impressions,
+                                    term.taps,
+                                    term.installs,
+                                    f"{term.spend:.2f}",
+                                    term.currency,
+                                ]
+                            )
+                    print_success(f"Exported {len(all_suggestions)} suggestions to {output}")
+                except Exception as e:
+                    print_error("Export failed", str(e))
+
+            # Apply negatives
+            if apply and not dry_run and negatives_list:
+                by_campaign: dict[int, list[tuple[SearchTermAnalysis, NegativeSuggestion]]] = defaultdict(list)
+                for term, suggestion in negatives_list:
+                    by_campaign[term.campaign_id].append((term, suggestion))
+
+                total_added = 0
+                for camp_id, items in by_campaign.items():
+                    camp_name = items[0][0].campaign_name
+                    neg_creates = [
+                        NegativeKeywordCreate(
+                            text=term.search_term,
+                            match_type=KeywordMatchType.EXACT,
+                        )
+                        for term, _ in items
+                    ]
+
+                    try:
+                        with spinner(f"Adding {len(neg_creates)} negatives to '{camp_name}'..."):
+                            client.campaigns(camp_id).negative_keywords.create_bulk(neg_creates)
+                        total_added += len(neg_creates)
+                    except AppleSearchAdsError as e:
+                        print_error(f"Failed to add negatives to '{camp_name}'", e.message)
+
+                if total_added > 0:
+                    print_success(f"Added {total_added} negative keywords across {len(by_campaign)} campaign(s)")
+
+            elif apply and dry_run:
+                print_info("Dry run — no changes applied. Remove --dry-run to apply negatives.")
 
     except AppleSearchAdsError as e:
         handle_api_error(e)
