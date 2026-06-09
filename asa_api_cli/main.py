@@ -6,6 +6,7 @@ import typer
 
 from asa_api_cli import (
     ad_groups,
+    ads,
     apps,
     auth,
     brand,
@@ -15,6 +16,7 @@ from asa_api_cli import (
     impression_share,
     keywords,
     optimize,
+    product_pages,
     reports,
     translate,
 )
@@ -31,7 +33,9 @@ app.add_typer(auth.app, name="auth", help="Authentication commands")
 app.add_typer(brand.app, name="brand", help="Create brand protection campaigns")
 app.add_typer(campaigns.app, name="campaigns", help="Manage campaigns")
 app.add_typer(ad_groups.app, name="ad-groups", help="Manage ad groups")
+app.add_typer(ads.app, name="ads", help="View ads (creatives) within ad groups")
 app.add_typer(keywords.app, name="keywords", help="Manage keywords")
+app.add_typer(product_pages.app, name="product-pages", help="View custom product pages (CPP)")
 app.add_typer(apps.app, name="apps", help="Search the App Store for advertisable apps")
 app.add_typer(geo.app, name="geo", help="Search geographic locations for targeting")
 app.add_typer(countries.app, name="countries", help="List supported countries and regions")

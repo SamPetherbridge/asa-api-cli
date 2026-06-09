@@ -67,3 +67,19 @@ def test_countries_help() -> None:
     result = runner.invoke(app, ["countries", "--help"])
     assert result.exit_code == 0
     assert "list" in result.stdout
+
+
+def test_ads_help() -> None:
+    """Test ads subcommand help."""
+    result = runner.invoke(app, ["ads", "--help"])
+    assert result.exit_code == 0
+    assert "list" in result.stdout
+    assert "get" in result.stdout
+
+
+def test_product_pages_help() -> None:
+    """Test product-pages subcommand help."""
+    result = runner.invoke(app, ["product-pages", "--help"])
+    assert result.exit_code == 0
+    assert "list" in result.stdout
+    assert "locales" in result.stdout
