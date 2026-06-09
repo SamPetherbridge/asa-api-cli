@@ -83,3 +83,11 @@ def test_product_pages_help() -> None:
     assert result.exit_code == 0
     assert "list" in result.stdout
     assert "locales" in result.stdout
+
+
+def test_budget_orders_help() -> None:
+    """Test budget-orders subcommand help."""
+    result = runner.invoke(app, ["budget-orders", "--help"])
+    assert result.exit_code == 0
+    assert "list" in result.stdout
+    assert "get" in result.stdout
