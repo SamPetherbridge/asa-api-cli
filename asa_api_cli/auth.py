@@ -1,7 +1,7 @@
 """Authentication CLI commands."""
 
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 import typer
 from asa_api_client import AppleSearchAdsClient, Settings
@@ -12,8 +12,12 @@ from rich.table import Table
 from asa_api_cli.utils import (
     EXIT_ERROR,
     EXIT_USAGE,
+    OutputFormat,
     console,
     error_console,
+    get_client,
+    handle_api_error,
+    output_data,
     print_error,
     print_info,
     print_result_panel,
@@ -200,3 +204,55 @@ def show_config(
             msg = err["msg"]
             error_console.print(f"  [error]ASA_{str(field).upper()}:[/error] {msg}")
         raise typer.Exit(EXIT_USAGE) from None
+
+
+ORG_COLUMNS = ["org_id", "org_name", "currency", "role_names", "time_zone"]
+
+
+@app.command("orgs")
+def list_orgs(
+    format: Annotated[
+        OutputFormat,
+        typer.Option("--format", "-f", help="Output format"),
+    ] = OutputFormat.TABLE,
+) -> None:
+    """List organizations your credentials can access.
+
+    Shows each org's ID (use as ASA_ORG_ID), name, currency, and your roles.
+
+    Examples:
+        asa auth orgs
+        asa auth orgs --format json
+    """
+    client = get_client()
+
+    try:
+        with client:
+            with spinner("Fetching accessible organizations..."):
+                acls = client.acls.list()
+
+            if not acls:
+                print_warning("No organizations found for these credentials")
+                return
+
+            rows: list[dict[str, Any]] = [
+                {
+                    "org_id": acl.org_id,
+                    "org_name": acl.org_name,
+                    "currency": acl.currency or "-",
+                    "role_names": ", ".join(acl.role_names) or "-",
+                    "time_zone": acl.time_zone or "-",
+                }
+                for acl in acls
+            ]
+
+            output_data(
+                rows,
+                ORG_COLUMNS,
+                format,
+                title="Accessible organizations",
+                column_labels={"org_id": "Org ID", "time_zone": "Time Zone"},
+            )
+    except AppleSearchAdsError as e:
+        handle_api_error(e)
+        raise typer.Exit(EXIT_ERROR) from None

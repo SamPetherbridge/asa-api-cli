@@ -37,6 +37,7 @@ def test_auth_help() -> None:
     assert result.exit_code == 0
     assert "show" in result.stdout
     assert "test" in result.stdout
+    assert "orgs" in result.stdout
 
 
 def test_root_help_lists_lookup_commands() -> None:
