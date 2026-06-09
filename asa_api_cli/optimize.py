@@ -1120,7 +1120,7 @@ def review_keyword_bids(
 
                             impressions = row.total.impressions or 0
                             taps = row.total.taps or 0
-                            conversions = row.total.installs or 0
+                            conversions = row.total.tap_installs or 0
                             spend_amount = row.total.local_spend.amount if row.total.local_spend else "0"
                             spend = Decimal(str(spend_amount))
                             currency = row.total.local_spend.currency if row.total.local_spend else "USD"
@@ -1650,7 +1650,7 @@ def analyze_cpa_cap_impact(
                                         }
                                     perf[ag_id]["impressions"] += row.total.impressions or 0
                                     perf[ag_id]["taps"] += row.total.taps or 0
-                                    perf[ag_id]["installs"] += row.total.installs or 0
+                                    perf[ag_id]["installs"] += row.total.tap_installs or 0
                                     if row.total.local_spend:
                                         perf[ag_id]["spend"] += Decimal(str(row.total.local_spend.amount))
                                         perf[ag_id]["currency"] = row.total.local_spend.currency
