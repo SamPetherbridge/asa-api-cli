@@ -59,12 +59,12 @@ def report_row_to_dict(row: object) -> dict[str, Any]:
         total = row.total  # type: ignore
         result["impressions"] = total.impressions
         result["taps"] = total.taps
-        result["installs"] = total.installs
+        result["installs"] = total.tap_installs
         result["ttr"] = total.ttr
-        result["conv_rate"] = total.conversion_rate
+        result["conv_rate"] = total.tap_install_rate
         result["spend"] = total.local_spend.amount if total.local_spend else None
         result["avg_cpt"] = total.avg_cpt.amount if total.avg_cpt else None
-        result["avg_cpa"] = total.avg_cpa.amount if total.avg_cpa else None
+        result["avg_cpa"] = total.total_avg_cpi.amount if total.total_avg_cpi else None
 
     return result
 
@@ -130,12 +130,12 @@ def print_grand_totals(report: object) -> None:
     lines = []
     lines.append(f"[label]Impressions:[/label] [value]{format_number(total.impressions)}[/value]")
     lines.append(f"[label]Taps:[/label] [value]{format_number(total.taps)}[/value]")
-    lines.append(f"[label]Installs:[/label] [value]{format_number(total.installs)}[/value]")
+    lines.append(f"[label]Installs:[/label] [value]{format_number(total.tap_installs)}[/value]")
 
     if total.ttr is not None:
         lines.append(f"[label]TTR:[/label] [value]{format_percent(total.ttr)}[/value]")
-    if total.conversion_rate is not None:
-        lines.append(f"[label]Conv Rate:[/label] [value]{format_percent(total.conversion_rate)}[/value]")
+    if total.tap_install_rate is not None:
+        lines.append(f"[label]Conv Rate:[/label] [value]{format_percent(total.tap_install_rate)}[/value]")
     if total.local_spend:
         spend = total.local_spend
         lines.append(f"[label]Total Spend:[/label] [value]{spend.amount} {spend.currency}[/value]")

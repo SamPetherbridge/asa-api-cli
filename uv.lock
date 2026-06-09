@@ -201,7 +201,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "asa-api-client", specifier = ">=0.1.5" },
+    { name = "asa-api-client", specifier = ">=0.2.1" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.13.0" },
     { name = "pre-commit", marker = "extra == 'dev'", specifier = ">=4.0.0" },
     { name = "pydantic-ai", specifier = ">=0.1.0" },
@@ -217,7 +217,7 @@ provides-extras = ["dev"]
 
 [[package]]
 name = "asa-api-client"
-version = "0.1.6"
+version = "0.2.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "httpx" },
@@ -225,9 +225,9 @@ dependencies = [
     { name = "pydantic-settings" },
     { name = "pyjwt", extra = ["crypto"] },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/cb/3c/6e4746ab9b9ae67b8bdc62247fa794f59721915550db3c284d45968ec506/asa_api_client-0.1.6.tar.gz", hash = "sha256:c0b27d5d91d1ea4b775afb7291a5d974e53de3f9a02343864d7909430a5bface", size = 104081, upload-time = "2025-12-11T23:06:42.809Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/f7/e8/6c0f77eabb48d28e1239e65bea3e118d756d49313817b311b2023b64d272/asa_api_client-0.2.1.tar.gz", hash = "sha256:5069e5e613b924d4cd1efca9601c43d35e61df998775913c328c99ddeac9cbaf", size = 113157, upload-time = "2026-06-09T00:43:03.74Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/fb/32/33715fe700870397fb196699e4b06334c6ead28608f9822bb77abd56a7be/asa_api_client-0.1.6-py3-none-any.whl", hash = "sha256:0a478048247ebaca1d7439a6bff577943e02f0b525e9226c4736f6dcba7ea35f", size = 49703, upload-time = "2025-12-11T23:06:41.318Z" },
+    { url = "https://files.pythonhosted.org/packages/6f/4b/9ebc458fc0030f562ee5dcc00cffb7d673f7489d49ae3043969b1e9bae3d/asa_api_client-0.2.1-py3-none-any.whl", hash = "sha256:1e474bce3db750f2cb70cfad7f948132a7236ff42b1bc2a8bc071578d3338ef0", size = 65543, upload-time = "2026-06-09T00:43:02.259Z" },
 ]
 
 [[package]]
