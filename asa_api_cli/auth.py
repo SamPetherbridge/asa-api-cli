@@ -67,7 +67,16 @@ def test_auth(
         table.add_column("Setting", style="label")
         table.add_column("Status")
 
-        errors_by_field = {err["loc"][0]: err["msg"] for err in e.errors()}
+        errors_by_field: dict[str, str] = {}
+        model_errors: list[str] = []
+        for err in e.errors():
+            if err["loc"]:
+                errors_by_field[str(err["loc"][0])] = err["msg"]
+            else:
+                model_errors.append(err["msg"])
+                if "private_key" in err["msg"]:
+                    errors_by_field.setdefault("private_key", err["msg"])
+                    errors_by_field.setdefault("private_key_path", err["msg"])
 
         for field in ["client_id", "team_id", "key_id", "org_id", "private_key", "private_key_path"]:
             if field in errors_by_field:
@@ -77,7 +86,11 @@ def test_auth(
 
         error_console.print(table)
         error_console.print()
-        print_error("Configuration Error", "Missing or invalid settings")
+        print_error(
+            "Configuration Error",
+            "Missing or invalid settings",
+            details="\n".join(model_errors) if model_errors else None,
+        )
         raise typer.Exit(EXIT_USAGE) from None
 
     # Display loaded configuration
@@ -200,9 +213,12 @@ def show_config(
     except ValidationError as e:
         print_error("Configuration Error", "Could not load settings")
         for err in e.errors():
-            field = err["loc"][0]
             msg = err["msg"]
-            error_console.print(f"  [error]ASA_{str(field).upper()}:[/error] {msg}")
+            if err["loc"]:
+                field = err["loc"][0]
+                error_console.print(f"  [error]ASA_{str(field).upper()}:[/error] {msg}")
+            else:
+                error_console.print(f"  [error]Configuration:[/error] {msg}")
         raise typer.Exit(EXIT_USAGE) from None
 
 

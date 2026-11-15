@@ -661,7 +661,7 @@ def review_negatives(
             # Step 2: Fetch all ad groups
             with spinner("Fetching ad groups..."):
                 ad_groups_resp = client.campaigns(campaign_id).ad_groups.find(
-                    Selector(conditions=[{"field": "status", "operator": "EQUALS", "values": ["ENABLED"]}])
+                    Selector().where("status", "==", "ENABLED")
                 )
                 ad_groups = ad_groups_resp
 
@@ -887,9 +887,7 @@ def review_skag(
 
             # Step 2: Fetch all ad groups
             with spinner("Fetching ad groups..."):
-                ad_groups = client.campaigns(campaign_id).ad_groups.find(
-                    Selector(conditions=[{"field": "status", "operator": "EQUALS", "values": ["ENABLED"]}])
-                )
+                ad_groups = client.campaigns(campaign_id).ad_groups.find(Selector().where("status", "==", "ENABLED"))
 
             if not ad_groups:
                 print_warning("No enabled ad groups found in this campaign")

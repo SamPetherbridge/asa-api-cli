@@ -15,12 +15,18 @@ Using [uv](https://docs.astral.sh/uv/) (recommended):
 
 ```bash
 uv tool install asa-api-cli
+
+# Include Excel workbook analysis support (pandas + xlsxwriter)
+uv tool install "asa-api-cli[analyze]"
 ```
 
 Using pip:
 
 ```bash
 pip install asa-api-cli
+
+# Or with Excel workbook analysis support
+pip install "asa-api-cli[analyze]"
 ```
 
 Using pipx:
@@ -95,6 +101,16 @@ asa reports keywords 123456789 --start 2024-01-01 --end 2024-01-31
 
 # Export to CSV
 asa reports campaigns --start 2024-01-01 --end 2024-01-31 --output report.csv
+```
+
+### Analysis Workbook & Platform API v1 Smoke Test
+
+```bash
+# Generate an Excel performance analysis workbook (requires [analyze] extra)
+asa analyze --period 30d --output asa-30d.xlsx
+
+# Run a read-only smoke test against the Apple Ads Platform API v1
+asa v1-smoke
 ```
 
 ### Brand Campaigns
