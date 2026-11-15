@@ -8,8 +8,8 @@ from unittest.mock import MagicMock
 import pytest
 import typer
 from asa_api_client.exceptions import PartialFailureError
-from asa_api_client.models.base import PaginatedResponse
-from asa_api_client.models.product_pages import ProductPage
+from asa_api_client.v1.models.base import V1Page, V1Pagination
+from asa_api_client.v1.models.product_pages import ProductPageDetails
 from rich.console import Console
 from typer.testing import CliRunner
 
@@ -36,6 +36,9 @@ def test_help() -> None:
     assert "ad-groups" in result.stdout
     assert "keywords" in result.stdout
     assert "reports" in result.stdout
+    assert "recommendations" in result.stdout
+    assert "suggestions" in result.stdout
+    assert "change-history" in result.stdout
 
 
 def test_campaigns_help() -> None:
@@ -51,11 +54,12 @@ def test_auth_help() -> None:
     assert result.exit_code == 0
     assert "show" in result.stdout
     assert "test" in result.stdout
+    assert "accounts" in result.stdout
     assert "orgs" in result.stdout
 
 
 def test_root_help_lists_lookup_commands() -> None:
-    """Root help should advertise the v5 lookup command groups."""
+    """Root help should advertise the Platform API v1 lookup command groups."""
     result = runner.invoke(app, ["--help"])
     assert result.exit_code == 0
     assert "apps" in result.stdout
@@ -68,6 +72,8 @@ def test_apps_help() -> None:
     result = runner.invoke(app, ["apps", "--help"])
     assert result.exit_code == 0
     assert "search" in result.stdout
+    assert "get" in result.stdout
+    assert "eligibilities" in result.stdout
 
 
 def test_geo_help() -> None:
@@ -93,10 +99,11 @@ def test_ads_help() -> None:
     assert "create" in result.stdout
     assert "update" in result.stdout
     assert "delete" in result.stdout
+    assert "creatives" in result.stdout
 
 
 def test_ads_create_creative_set_rejected() -> None:
-    """CREATIVE_SET is not supported by the create command (no asset selection)."""
+    """CREATIVE_SET is not supported by the create command (retired in Platform API v1)."""
     result = runner.invoke(
         app,
         ["ads", "create", "-c", "1", "-a", "2", "-n", "x", "-t", "CREATIVE_SET"],
@@ -143,6 +150,7 @@ def test_product_pages_help() -> None:
     assert result.exit_code == 0
     assert "list" in result.stdout
     assert "locales" in result.stdout
+    assert "app-locales" in result.stdout
 
 
 def test_budget_orders_help() -> None:
@@ -204,7 +212,7 @@ def test_auth_missing_private_key_model_error(monkeypatch: pytest.MonkeyPatch, t
     monkeypatch.setenv("ASA_CLIENT_ID", "SEARCHADS.test-client-id")
     monkeypatch.setenv("ASA_TEAM_ID", "TESTTEAM")
     monkeypatch.setenv("ASA_KEY_ID", "TESTKEY")
-    monkeypatch.setenv("ASA_ORG_ID", "123456")
+    monkeypatch.setenv("ASA_AD_ACCOUNT_ID", "123456")
     monkeypatch.delenv("ASA_PRIVATE_KEY", raising=False)
     monkeypatch.delenv("ASA_PRIVATE_KEY_PATH", raising=False)
 
@@ -243,19 +251,21 @@ def test_handle_api_error_partial_failure(monkeypatch: pytest.MonkeyPatch) -> No
 
 
 def test_product_pages_passes_adam_id(monkeypatch: pytest.MonkeyPatch) -> None:
-    """product-pages commands must scope ProductPageResource with --adam-id."""
+    """product-pages list must filter ProductPagesResource by adamId."""
     mock_client = MagicMock()
     mock_client.__enter__.return_value = mock_client
-    mock_resource = MagicMock()
-    mock_resource.list.return_value = PaginatedResponse[ProductPage](
-        data=[ProductPage(id="pp-1", adamId=987654321, name="Holiday", state="VISIBLE")]
+    mock_client.product_pages.query.return_value = V1Page[ProductPageDetails](
+        result=[ProductPageDetails(id="pp-1", adamId="987654321", name="Holiday", state="AVAILABLE")],
+        pagination=V1Pagination(totalCount=1, offset=0, limit=100),
     )
-    mock_client.product_pages.return_value = mock_resource
     monkeypatch.setattr(product_pages, "get_client", lambda: mock_client)
 
     result = runner.invoke(app, ["product-pages", "list", "--adam-id", "987654321", "--format", "json"])
     assert result.exit_code == 0
-    mock_client.product_pages.assert_called_once_with(987654321)
+    mock_client.product_pages.query.assert_called_once()
+    passed_query = mock_client.product_pages.query.call_args.args[0]
+    payload = passed_query.to_payload()
+    assert {"field": "adamId", "operator": "EQUALS", "value": 987654321} in payload["filters"]
     assert "pp-1" in result.stdout
 
 

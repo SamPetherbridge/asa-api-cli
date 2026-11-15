@@ -13,20 +13,23 @@ from asa_api_cli import (
     brand,
     budget_orders,
     campaigns,
+    change_history,
     countries,
     geo,
     impression_share,
     keywords,
     optimize,
     product_pages,
+    recommendations,
     reports,
+    suggestions,
     translate,
 )
 from asa_api_cli.utils import EXIT_ERROR, cli_state, error_console, init_consoles, print_error
 
 app = typer.Typer(
     name="asa",
-    help="Apple Search Ads API CLI - Manage campaigns, ad groups, keywords, and reports.",
+    help="Apple Ads Platform API v1 CLI - Manage campaigns, ad groups, keywords, insights, and reports.",
     rich_markup_mode="rich",
 )
 
@@ -63,20 +66,23 @@ def _register_analyze_command(target_app: typer.Typer) -> None:
 
 
 # Register sub-commands
-app.add_typer(auth.app, name="auth", help="Authentication commands")
-app.add_typer(brand.app, name="brand", help="Create brand protection campaigns")
+app.add_typer(auth.app, name="auth", help="Authentication and ad account commands")
+app.command("brand", help="Create brand protection campaigns")(brand.create_brand_campaigns)
 app.add_typer(campaigns.app, name="campaigns", help="Manage campaigns")
 app.add_typer(ad_groups.app, name="ad-groups", help="Manage ad groups")
-app.add_typer(ads.app, name="ads", help="View and manage ads (creatives) within ad groups")
-app.add_typer(keywords.app, name="keywords", help="Manage keywords")
-app.add_typer(product_pages.app, name="product-pages", help="View custom product pages (CPP)")
-app.add_typer(apps.app, name="apps", help="Search the App Store for advertisable apps")
+app.add_typer(ads.app, name="ads", help="View and manage ads and creatives")
+app.add_typer(keywords.app, name="keywords", help="Manage keywords and negative keywords")
+app.add_typer(product_pages.app, name="product-pages", help="View App Store product pages (DPPs, CPPs, PPO)")
+app.add_typer(apps.app, name="apps", help="Search App Store apps, metadata, and ad eligibilities")
 app.add_typer(geo.app, name="geo", help="Search geographic locations for targeting")
-app.add_typer(countries.app, name="countries", help="List supported countries and regions")
-app.add_typer(budget_orders.app, name="budget-orders", help="View budget orders")
-app.add_typer(reports.app, name="reports", help="Generate reports")
+app.add_typer(countries.app, name="countries", help="List supported countries, regions, and languages")
+app.add_typer(budget_orders.app, name="budget-orders", help="View shared budgets (budget orders)")
+app.add_typer(reports.app, name="reports", help="Generate performance reports")
+app.add_typer(recommendations.app, name="recommendations", help="View, apply, and dismiss optimization recommendations")
+app.add_typer(suggestions.app, name="suggestions", help="Query keyword, phrase, category, and Target CPA suggestions")
+app.add_typer(change_history.app, name="change-history", help="Inspect account change history and audit details")
 app.add_typer(optimize.app, name="optimize", help="Optimization tools")
-app.add_typer(impression_share.app, name="impression-share", help="Impression share analysis")
+app.add_typer(impression_share.app, name="impression-share", help="Impression share and search popularity insights")
 app.add_typer(translate.app, name="translate", help="Translate keywords to multiple languages")
 _register_analyze_command(app)
 app.command(
@@ -111,6 +117,14 @@ def main(
             help="Show version and exit",
             callback=version_callback,
             is_eager=True,
+        ),
+    ] = None,
+    ad_account: Annotated[
+        int | None,
+        typer.Option(
+            "--ad-account",
+            "-A",
+            help="Apple Ads ad account ID override (overrides ASA_AD_ACCOUNT_ID)",
         ),
     ] = None,
     quiet: Annotated[
@@ -156,21 +170,23 @@ def main(
         ),
     ] = False,
 ) -> None:
-    """Apple Search Ads API CLI.
+    """Apple Ads Platform API v1 CLI.
 
-    Manage your Apple Search Ads campaigns, ad groups, keywords,
-    and generate performance reports from the command line.
+    Manage your Apple Ads campaigns, ad groups, keywords, creatives,
+    recommendations, suggestions, change history, and performance reports
+    from the command line.
 
     Set up authentication using environment variables:
 
         export ASA_CLIENT_ID="SEARCHADS.your-client-id"
-        export ASA_TEAM_ID="YOUR_TEAM_ID"
-        export ASA_KEY_ID="YOUR_KEY_ID"
-        export ASA_ORG_ID="123456"
+        export ASA_TEAM_ID="SEARCHADS.your-team-id"
+        export ASA_KEY_ID="your-key-id"
+        export ASA_AD_ACCOUNT_ID="123456"
         export ASA_PRIVATE_KEY_PATH="/path/to/private-key.pem"
 
-    Or test your credentials:
+    Discover accessible ad accounts or test your credentials:
 
+        asa auth accounts
         asa auth test
 
     Enable shell completion:
@@ -178,6 +194,7 @@ def main(
         asa --install-completion
     """
     # Set global CLI state
+    cli_state.ad_account_id = ad_account
     cli_state.quiet = quiet
     cli_state.verbose = verbose
     cli_state.no_input = no_input

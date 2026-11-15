@@ -1,10 +1,10 @@
-"""Supported country/region reference CLI commands."""
+"""Supported countries/regions and ad languages CLI commands (Platform API v1)."""
 
 from typing import Annotated, Any
 
 import typer
 from asa_api_client.exceptions import AppleSearchAdsError
-from asa_api_client.models import LanguageDetail
+from asa_api_client.v1.query import Query
 
 from asa_api_cli.utils import (
     EXIT_ERROR,
@@ -16,69 +16,63 @@ from asa_api_cli.utils import (
     spinner,
 )
 
-app = typer.Typer(help="List supported countries and regions")
+app = typer.Typer(help="View supported countries, regions, and ad languages")
 
-COUNTRY_COLUMNS = ["country_or_region", "default_language", "supported_languages"]
-
-
-def _language_label(detail: LanguageDetail | None) -> str:
-    """Render a LanguageDetail as a short label, e.g. "English (en)"."""
-    if detail is None:
-        return "-"
-    if detail.language and detail.language_code:
-        return f"{detail.language} ({detail.language_code})"
-    return detail.language or detail.language_code or "-"
+COUNTRY_COLUMNS = ["country_code", "name", "default_languages", "supported_languages"]
 
 
 @app.command("list")
 def list_countries(
-    codes: Annotated[
+    countries: Annotated[
         list[str] | None,
-        typer.Option("--code", "-c", help="Filter by ISO alpha-2 code (repeatable, e.g. -c US -c GB)"),
+        typer.Option("--country", "-c", help="Filter by ISO 3166-1 alpha-2 country code(s)"),
     ] = None,
+    limit: Annotated[
+        int,
+        typer.Option("--limit", "-l", help="Maximum number of countries to return"),
+    ] = 200,
     format: Annotated[
         OutputFormat,
         typer.Option("--format", "-f", help="Output format"),
     ] = OutputFormat.TABLE,
 ) -> None:
-    """List countries and regions supported for advertising.
+    """List Apple Ads supported countries/regions and their ad languages.
 
-    Shows each region's default and supported ad languages.
+    Uses ``POST /v1/metadata/apps/supported-languages/query``.
 
     Examples:
         asa countries list
-        asa countries list --code US --code GB
+        asa countries list --country US --country CA
         asa countries list --format json
     """
     client = get_client()
 
     try:
         with client:
-            with spinner("Fetching supported countries..."):
-                results = client.countries_or_regions.list(
-                    countries_or_regions=[c.upper() for c in codes] if codes else None,
-                )
+            with spinner("Fetching supported countries and languages..."):
+                q = Query().page(size=limit, fetch_total_count=True)
+                if countries:
+                    q = q.where("countryCode", "IN", [c.upper() for c in countries])
+                page = client.apps.query_supported_languages(q)
 
-            if not results:
-                print_warning("No countries found")
+            if not page.result:
+                print_warning("No countries returned")
                 return
 
-            rows: list[dict[str, Any]] = [
-                {
-                    "country_or_region": cr.country_or_region,
-                    "default_language": _language_label(cr.default_language),
-                    "supported_languages": ", ".join(_language_label(lang) for lang in cr.supported_languages or [])
-                    or "-",
-                }
-                for cr in results
-            ]
+            rows: list[dict[str, Any]] = []
+            for item in sorted(page.result, key=lambda c: c.country_code or ""):
+                defaults = [loc.language_code or loc.language or "" for loc in (item.ads_default_languages or [])]
+                supported = [loc.language_code or loc.language or "" for loc in (item.ads_supported_languages or [])]
+                rows.append(
+                    {
+                        "country_code": item.country_code or "-",
+                        "name": item.name or "-",
+                        "default_languages": ", ".join(filter(None, defaults)) or "-",
+                        "supported_languages": ", ".join(filter(None, supported)) or "-",
+                    }
+                )
 
-            output_data(
-                rows,
-                COUNTRY_COLUMNS,
-                format,
-                title="Supported countries / regions",
-            )
+            output_data(rows, COUNTRY_COLUMNS, format, title="Supported countries and regions")
     except AppleSearchAdsError as e:
         handle_api_error(e)
         raise typer.Exit(EXIT_ERROR) from None

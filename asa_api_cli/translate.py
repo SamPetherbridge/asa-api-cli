@@ -1,4 +1,4 @@
-"""Keyword translation module using PydanticAI.
+"""Keyword translation module using PydanticAI for Apple Ads Platform API v1.
 
 Provides AI-powered keyword translation with support for:
 - Claude (Anthropic) and Gemini (Google) models
@@ -8,6 +8,7 @@ Provides AI-powered keyword translation with support for:
 
 from __future__ import annotations
 
+from collections import defaultdict
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
@@ -15,12 +16,11 @@ from typing import Annotated, Literal
 
 import typer
 from asa_api_client.exceptions import AppleSearchAdsError
-from asa_api_client.models import (
-    AdGroupCreate,
-    KeywordCreate,
-    KeywordMatchType,
-    Money,
-)
+from asa_api_client.v1.models.ad_groups import AdGroupCreate, AdGroupStatus, PricingModel
+from asa_api_client.v1.models.base import Money
+from asa_api_client.v1.models.bulk import BulkKeywordCreate
+from asa_api_client.v1.models.keywords import Keyword, KeywordMatchType, KeywordStatus
+from asa_api_client.v1.query import Query
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent
 from pydantic_ai.models import Model
@@ -38,14 +38,19 @@ from asa_api_cli.languages import (
 )
 from asa_api_cli.utils import (
     EXIT_ERROR,
+    ad_group_bid_money,
+    campaign_countries,
+    campaign_currency,
     console,
     get_client,
     handle_api_error,
+    manual_cpt_bid_strategy,
     print_error,
     print_info,
     print_result_panel,
     print_success,
     print_warning,
+    require_id,
     spinner,
 )
 
@@ -62,13 +67,7 @@ app = typer.Typer(
 
 
 class TranslateSettings(BaseSettings):  # type: ignore[misc]
-    """Translation configuration loaded from environment/.env file.
-
-    Supports the following environment variables:
-    - ANTHROPIC_API_KEY: API key for Claude models
-    - GEMINI_API_KEY: API key for Google Gemini models
-    - TRANSLATE_PROVIDER: Default provider ("anthropic" or "gemini")
-    """
+    """Translation configuration loaded from environment/.env file."""
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -82,14 +81,7 @@ class TranslateSettings(BaseSettings):  # type: ignore[misc]
 
 
 def get_translate_settings(env_file: Path | None = None) -> TranslateSettings:
-    """Load translation settings from environment and .env file.
-
-    Args:
-        env_file: Optional path to .env file. Defaults to ".env" in current directory.
-
-    Returns:
-        TranslateSettings instance.
-    """
+    """Load translation settings from environment and .env file."""
     if env_file is not None:
         return TranslateSettings(_env_file=env_file)  # type: ignore[call-arg]
     return TranslateSettings()
@@ -141,23 +133,10 @@ def get_translation_agent(
     settings: TranslateSettings | None = None,
     provider: str | None = None,
 ) -> Agent[None, KeywordTranslations]:
-    """Create a translation agent with the specified provider.
-
-    Args:
-        settings: Translation settings. If None, loads from environment/.env.
-        provider: Override the provider from settings ("anthropic" or "gemini").
-
-    Returns:
-        Configured PydanticAI agent.
-
-    Raises:
-        ValueError: If provider is unknown.
-        RuntimeError: If API key is not configured.
-    """
+    """Create a translation agent with the specified provider."""
     if settings is None:
         settings = get_translate_settings()
 
-    # Use provided provider or fall back to settings default
     active_provider = provider or settings.translate_provider
 
     model: Model
@@ -199,18 +178,7 @@ async def translate_keywords(
     settings: TranslateSettings | None = None,
     provider: str | None = None,
 ) -> KeywordTranslations:
-    """Translate a list of keywords.
-
-    Args:
-        keywords: List of keywords to translate.
-        source_language: Source language code (e.g., "en").
-        target_language: Target language code (e.g., "es").
-        settings: Translation settings. If None, loads from environment/.env.
-        provider: Override the provider from settings.
-
-    Returns:
-        KeywordTranslations with all translated keywords.
-    """
+    """Translate a list of keywords."""
     agent = get_translation_agent(settings=settings, provider=provider)
 
     source_name = get_language_name(source_language)
@@ -244,9 +212,9 @@ class AdGroupAnalysis:
     bid: Decimal
     currency: str
     detected_language: str | None
-    english_keyword: str  # Parsed from ad group name
-    existing_translations: list[str]  # Languages already translated
-    missing_translations: list[str]  # Languages that need translation
+    english_keyword: str
+    existing_translations: list[str]
+    missing_translations: list[str]
 
 
 @dataclass
@@ -259,7 +227,7 @@ class TranslationPlan:
     match_type: str
     bid: Decimal
     currency: str
-    ad_group_name: str  # The new ad group name
+    ad_group_name: str
 
 
 # ============================================================================
@@ -292,63 +260,55 @@ def detect_translations(
 
     try:
         with client:
-            # Get campaign details
             with spinner("Loading campaign..."):
                 campaign = client.campaigns.get(campaign_id)
 
-            campaign_name = campaign.name
-            countries = campaign.countries_or_regions or []
+            campaign_name = campaign.name or f"Campaign {campaign_id}"
+            countries = campaign_countries(campaign)
             country = countries[0] if countries else "US"
 
             console.print()
             console.print(f"[bold]Campaign:[/bold] {campaign_name}")
             console.print(f"[bold]Country:[/bold] {country}")
 
-            # Get available languages for this country
             available_languages = get_languages_for_country(country)
-            if target_language:
-                target_languages = [target_language.lower()]
-            else:
-                target_languages = available_languages
+            target_languages = [target_language.lower()] if target_language else available_languages
 
             console.print(f"[bold]Languages:[/bold] {', '.join(target_languages)}")
             console.print()
 
-            # Get all ad groups
-            with spinner("Loading ad groups..."):
-                ad_groups = client.campaigns(campaign_id).ad_groups.list(limit=1000)
+            with spinner("Loading ad groups and keywords..."):
+                ad_groups = list(client.ad_groups.iter_all(Query().where("campaignId", "EQUALS", campaign_id)))
+                all_keywords = list(client.keywords.iter_all(Query().where("campaignId", "EQUALS", campaign_id)))
 
-            if not ad_groups.data:
+            if not ad_groups:
                 print_warning("No ad groups found in this campaign")
                 return
 
-            # Analyze each ad group
-            keyword_groups: dict[str, list[str]] = {}  # english_keyword -> [existing languages]
+            keywords_by_ag: dict[int, list[Keyword]] = defaultdict(list)
+            for kw in all_keywords:
+                if kw.ad_group_id is not None:
+                    keywords_by_ag[kw.ad_group_id].append(kw)
 
-            with spinner("Analyzing keywords..."):
-                for ag in ad_groups.data:
-                    # Get keywords in this ad group
-                    keywords = client.campaigns(campaign_id).ad_groups(ag.id).keywords.list(limit=10)
+            keyword_groups: dict[str, list[str]] = {}
 
-                    if not keywords.data:
-                        continue
+            for ag in ad_groups:
+                if ag.id is None or not keywords_by_ag.get(ag.id):
+                    continue
 
-                    # Parse ad group name
-                    parts = parse_ad_group_name(ag.name)
-                    english_keyword = parts.keyword.lower()
+                ag_name = ag.name or ""
+                parts = parse_ad_group_name(ag_name)
+                english_keyword = parts.keyword.lower()
 
-                    # Track existing translations
-                    if english_keyword not in keyword_groups:
-                        keyword_groups[english_keyword] = []
+                if english_keyword not in keyword_groups:
+                    keyword_groups[english_keyword] = []
 
-                    if parts.language:
-                        keyword_groups[english_keyword].append(parts.language)
-                    else:
-                        # No tag, assume source language
-                        source_lang = detect_source_language(country, ag.name)
-                        keyword_groups[english_keyword].append(source_lang)
+                if parts.language:
+                    keyword_groups[english_keyword].append(parts.language)
+                else:
+                    source_lang = detect_source_language(country, ag_name)
+                    keyword_groups[english_keyword].append(source_lang)
 
-            # Build analysis table
             console.print(Rule("Translation Analysis"))
             console.print()
 
@@ -369,7 +329,6 @@ def detect_translations(
             console.print(table)
             console.print()
 
-            # Summary
             total_keywords = len(keyword_groups)
             needs_translation = sum(
                 1 for existing in keyword_groups.values() if any(lang not in existing for lang in target_languages)
@@ -417,25 +376,9 @@ def translate_keywords_command(
         typer.Option("--env-file", "-e", help="Path to .env file with API keys"),
     ] = None,
 ) -> None:
-    """Translate keywords and create SKAGs.
-
-    Translates keywords that don't have a translation in the target language,
-    then creates new ad groups with the translated keywords.
-
-    API keys can be set in a .env file:
-        ANTHROPIC_API_KEY=sk-ant-...
-        GEMINI_API_KEY=...
-        TRANSLATE_PROVIDER=anthropic
-
-    Examples:
-        asa translate keywords 123456789 --target-language es
-        asa translate keywords 123456789 -t fr --provider gemini
-        asa translate keywords 123456789 -t de --dry-run
-        asa translate keywords 123456789 -t es --env-file .env.production
-    """
+    """Translate keywords and create SKAGs."""
     import asyncio
 
-    # Load settings from .env file
     settings = get_translate_settings(env_file)
     active_provider = provider or settings.translate_provider
 
@@ -446,12 +389,11 @@ def translate_keywords_command(
 
     try:
         with client:
-            # Get campaign details
             with spinner("Loading campaign..."):
                 campaign = client.campaigns.get(campaign_id)
 
-            campaign_name = campaign.name
-            currency = campaign.daily_budget_amount.currency if campaign.daily_budget_amount else "USD"
+            campaign_name = campaign.name or f"Campaign {campaign_id}"
+            currency = campaign_currency(campaign)
 
             console.print()
             console.print(f"[bold]Campaign:[/bold] {campaign_name}")
@@ -459,47 +401,53 @@ def translate_keywords_command(
             console.print(f"[bold]Provider:[/bold] {active_provider}")
             console.print()
 
-            # Get ad groups
-            with spinner("Loading ad groups..."):
+            with spinner("Loading ad groups and keywords..."):
                 if ad_group_id:
-                    ad_groups_data = [client.campaigns(campaign_id).ad_groups.get(ad_group_id)]
+                    ad_groups_data = [client.ad_groups.get(ad_group_id)]
+                    kw_query = Query().where("adGroupId", "EQUALS", ad_group_id)
                 else:
-                    result = client.campaigns(campaign_id).ad_groups.list(limit=1000)
-                    ad_groups_data = result.data or []
+                    ad_groups_data = list(client.ad_groups.iter_all(Query().where("campaignId", "EQUALS", campaign_id)))
+                    kw_query = Query().where("campaignId", "EQUALS", campaign_id)
+                all_keywords = list(client.keywords.iter_all(kw_query))
 
             if not ad_groups_data:
                 print_warning("No ad groups found")
                 return
 
-            # Find keywords needing translation
-            keywords_to_translate: list[tuple[str, str, Decimal]] = []  # (english_kw, match_type, bid)
-            existing_translations: set[str] = set()  # english keywords already translated
+            keywords_by_ag: dict[int, list[Keyword]] = defaultdict(list)
+            for kw in all_keywords:
+                if kw.ad_group_id is not None:
+                    keywords_by_ag[kw.ad_group_id].append(kw)
 
-            with spinner("Analyzing keywords..."):
-                for ag in ad_groups_data:
-                    parts = parse_ad_group_name(ag.name)
-                    english_kw = parts.keyword.lower()
+            keywords_to_translate: list[tuple[str, str, Decimal]] = []
+            existing_translations: set[str] = set()
 
-                    # Check if this is already the target language
-                    if parts.language == target_lang:
-                        existing_translations.add(english_kw)
-                        continue
+            for ag in ad_groups_data:
+                if ag.id is None:
+                    continue
+                parts = parse_ad_group_name(ag.name or "")
+                english_kw = parts.keyword.lower()
 
-                    # Get the keyword's bid
-                    keywords = client.campaigns(campaign_id).ad_groups(ag.id).keywords.list(limit=1)
-                    if not keywords.data:
-                        continue
+                if parts.language == target_lang:
+                    existing_translations.add(english_kw)
+                    continue
 
-                    kw = keywords.data[0]
-                    bid = Decimal(kw.bid_amount.amount) if kw.bid_amount else Decimal("1.00")
+                ag_keywords = keywords_by_ag.get(ag.id, [])
+                if not ag_keywords:
+                    continue
 
-                    # Only add if not already translated
-                    if english_kw not in existing_translations:
-                        # Check if we already have this keyword queued
-                        if not any(k[0] == english_kw for k in keywords_to_translate):
-                            keywords_to_translate.append((english_kw, parts.match_type, bid))
+                kw = ag_keywords[0]
+                if kw.bid and kw.bid.amount is not None:
+                    bid = Decimal(kw.bid.amount)
+                else:
+                    ag_bid = ad_group_bid_money(ag)
+                    bid = Decimal(ag_bid.amount) if ag_bid and ag_bid.amount is not None else Decimal("1.00")
 
-            # Filter out already translated
+                if english_kw not in existing_translations and not any(
+                    k[0] == english_kw for k in keywords_to_translate
+                ):
+                    keywords_to_translate.append((english_kw, parts.match_type, bid))
+
             keywords_to_translate = [
                 (kw, mt, bid) for kw, mt, bid in keywords_to_translate if kw not in existing_translations
             ]
@@ -511,7 +459,6 @@ def translate_keywords_command(
             console.print(f"Found {len(keywords_to_translate)} keywords to translate")
             console.print()
 
-            # Translate keywords
             with spinner(f"Translating to {target_name}..."):
                 translations = asyncio.run(
                     translate_keywords(
@@ -523,12 +470,10 @@ def translate_keywords_command(
                     )
                 )
 
-            # Build translation mapping
             translation_map: dict[str, str] = {}
             for t in translations.translations:
                 translation_map[t.original.lower()] = t.translated.lower()
 
-            # Create translation plans
             plans: list[TranslationPlan] = []
             for english_kw, match_type, bid in keywords_to_translate:
                 translated = translation_map.get(english_kw, english_kw)
@@ -546,7 +491,6 @@ def translate_keywords_command(
                     )
                 )
 
-            # Display preview
             console.print(Rule("Translation Preview"))
             console.print()
 
@@ -571,41 +515,37 @@ def translate_keywords_command(
                 print_info("Dry run - no SKAGs created")
                 return
 
-            # Confirm creation
             if not typer.confirm(f"Create {len(plans)} new SKAGs?", default=True):
                 print_info("Cancelled")
                 return
 
-            # Create SKAGs
             created_count = 0
             for plan in plans:
                 with spinner(f"Creating: {plan.ad_group_name}"):
-                    # Create ad group
-                    new_ag = client.campaigns(campaign_id).ad_groups.create(
+                    new_ag = client.ad_groups.create(
                         AdGroupCreate(
+                            campaign_id=campaign_id,
                             name=plan.ad_group_name,
-                            default_bid_amount=Money(
-                                amount=str(plan.bid),
-                                currency=plan.currency,
-                            ),
+                            pricing_model=PricingModel.CPT,
+                            bid_strategy=manual_cpt_bid_strategy(plan.bid, plan.currency),
                             automated_keywords_opt_in=False,
+                            status=AdGroupStatus.ENABLED,
                         )
                     )
+                    new_ag_id = require_id(new_ag.id, "Ad group")
 
-                    # Add translated keyword
                     match_type = (
                         KeywordMatchType.EXACT if plan.match_type.lower() == "exact" else KeywordMatchType.BROAD
                     )
 
-                    client.campaigns(campaign_id).ad_groups(new_ag.id).keywords.create_bulk(
+                    client.bulk.create_keywords(
                         [
-                            KeywordCreate(
+                            BulkKeywordCreate(
+                                ad_group_id=new_ag_id,
                                 text=plan.translated_keyword,
                                 match_type=match_type,
-                                bid_amount=Money(
-                                    amount=str(plan.bid),
-                                    currency=plan.currency,
-                                ),
+                                bid=Money(amount=str(plan.bid), currency=plan.currency),
+                                status=KeywordStatus.ENABLED,
                             )
                         ]
                     )
@@ -613,7 +553,6 @@ def translate_keywords_command(
                 created_count += 1
                 print_success(f"Created: {plan.ad_group_name}")
 
-            # Summary
             console.print()
             print_result_panel(
                 "Translation Complete",
@@ -646,15 +585,8 @@ def list_languages(
         typer.Argument(help="Country code to show languages for (e.g., US, ES, DE)"),
     ] = None,
 ) -> None:
-    """List supported languages and country mappings.
-
-    Examples:
-        asa translate languages         # List all languages
-        asa translate languages US      # Show languages for US
-        asa translate languages ES      # Show languages for Spain
-    """
+    """List supported languages and country mappings."""
     if country:
-        # Show languages for specific country
         languages = get_languages_for_country(country)
         if not languages:
             print_warning(f"No language mapping found for country: {country}")
@@ -664,7 +596,6 @@ def list_languages(
         for lang in languages:
             console.print(f"  {lang} - {get_language_name(lang)}")
     else:
-        # List all supported languages
         console.print("[bold]Supported Languages:[/bold]")
         console.print()
 
@@ -685,15 +616,7 @@ def show_config(
         typer.Option("--env-file", "-e", help="Path to .env file"),
     ] = None,
 ) -> None:
-    """Show current translation configuration.
-
-    Displays API keys and default provider loaded from .env file
-    or environment variables.
-
-    Examples:
-        asa translate config
-        asa translate config --env-file .env.production
-    """
+    """Show current translation configuration."""
     settings = get_translate_settings(env_file)
 
     source = f"from {env_file}" if env_file else "from .env / environment"
@@ -706,7 +629,6 @@ def show_config(
     table.add_column("Setting")
     table.add_column("Value")
 
-    # Mask API keys for display
     if settings.anthropic_api_key:
         masked = settings.anthropic_api_key[:10] + "..." + settings.anthropic_api_key[-4:]
         table.add_row("ANTHROPIC_API_KEY", f"[success]{masked}[/success]")

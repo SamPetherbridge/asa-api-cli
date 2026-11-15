@@ -1,15 +1,16 @@
-"""Budget order CLI commands."""
+"""Budget order (shared budget) CLI commands (Platform API v1)."""
 
 from typing import Annotated, Any
 
 import typer
 from asa_api_client.exceptions import AppleSearchAdsError
+from asa_api_client.v1.query import Query
 
 from asa_api_cli.utils import (
     EXIT_ERROR,
     OutputFormat,
     enum_value,
-    format_money,
+    format_money_obj,
     get_client,
     handle_api_error,
     output_data,
@@ -18,7 +19,7 @@ from asa_api_cli.utils import (
     spinner,
 )
 
-app = typer.Typer(help="View budget orders")
+app = typer.Typer(help="View budget orders (shared budgets)")
 
 BUDGET_ORDER_COLUMNS = ["id", "name", "status", "budget", "order_number", "start_date", "end_date"]
 
@@ -41,7 +42,7 @@ def list_budget_orders(
         typer.Option("--format", "-f", help="Output format"),
     ] = OutputFormat.TABLE,
 ) -> None:
-    """List budget orders.
+    """List budget orders (shared budgets).
 
     Examples:
         asa budget-orders list
@@ -52,9 +53,9 @@ def list_budget_orders(
     try:
         with client:
             with spinner("Fetching budget orders..."):
-                result = client.budget_orders.list(limit=limit)
+                page = client.budget_orders.query(Query().page(size=limit, fetch_total_count=True))
 
-            if not result.data:
+            if not page.result:
                 print_warning("No budget orders found")
                 return
 
@@ -62,13 +63,15 @@ def list_budget_orders(
                 {
                     "id": bo.id,
                     "name": bo.name or "-",
-                    "status": enum_value(bo.status) if bo.status else "-",
-                    "budget": format_money(bo.budget.amount, bo.budget.currency) if bo.budget else "-",
-                    "order_number": bo.order_number or "-",
-                    "start_date": _date_str(bo.start_date),
-                    "end_date": _date_str(bo.end_date),
+                    "status": enum_value(bo.system_status) or "-",
+                    "budget": format_money_obj(bo.value),
+                    "order_number": (
+                        bo.invoice_detail.order_number if bo.invoice_detail and bo.invoice_detail.order_number else "-"
+                    ),
+                    "start_date": _date_str(bo.start_time),
+                    "end_date": _date_str(bo.end_time),
                 }
-                for bo in result.data
+                for bo in page.result
             ]
 
             output_data(rows, BUDGET_ORDER_COLUMNS, format, title="Budget orders")
@@ -96,17 +99,23 @@ def get_budget_order(
             with spinner("Fetching budget order..."):
                 bo = client.budget_orders.get(budget_order_id)
 
+            reasons = ", ".join(enum_value(r) for r in bo.system_status_reasons) if bo.system_status_reasons else "-"
+            accounts = ", ".join(str(aid) for aid in bo.ad_account_ids) if bo.ad_account_ids else "-"
+            inv = bo.invoice_detail
+
             print_result_panel(
                 f"Budget order {bo.id}",
                 {
                     "Name": bo.name or "-",
-                    "Status": enum_value(bo.status) if bo.status else "-",
-                    "Budget": format_money(bo.budget.amount, bo.budget.currency) if bo.budget else "-",
-                    "Order number": bo.order_number or "-",
-                    "Start date": _date_str(bo.start_date),
-                    "End date": _date_str(bo.end_date),
-                    "Client name": bo.client_name or "-",
-                    "Billing email": bo.billing_email or "-",
+                    "Status": enum_value(bo.system_status) or "-",
+                    "Status reasons": reasons,
+                    "Budget": format_money_obj(bo.value),
+                    "Ad accounts": accounts,
+                    "Order number": inv.order_number if inv and inv.order_number else "-",
+                    "Start date": _date_str(bo.start_time),
+                    "End date": _date_str(bo.end_time),
+                    "Client name": inv.client_name if inv and inv.client_name else "-",
+                    "Billing email": inv.billing_email if inv and inv.billing_email else "-",
                 },
             )
     except AppleSearchAdsError as e:

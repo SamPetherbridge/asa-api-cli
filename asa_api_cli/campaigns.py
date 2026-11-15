@@ -1,24 +1,42 @@
-"""Campaign CLI commands."""
+"""Campaign management CLI commands (Platform API v1)."""
 
 from datetime import date, timedelta
-from typing import Annotated, Any
+from decimal import Decimal
+from typing import Annotated
 
 import typer
 from asa_api_client.exceptions import AppleSearchAdsError
-from asa_api_client.models import CampaignStatus, CampaignUpdate, Money, Selector
+from asa_api_client.v1.models.base import Money
+from asa_api_client.v1.models.campaigns import (
+    CampaignStatus,
+    CampaignUpdate,
+    DailyBudget,
+)
+from asa_api_client.v1.models.reports import (
+    AppsReportingRequest,
+    ReportFilter,
+    ReportFilterOperator,
+    ReportGranularity,
+    ReportTimeRange,
+)
+from asa_api_client.v1.query import Query
 
 from asa_api_cli.utils import (
     EXIT_ERROR,
     EXIT_USAGE,
     OutputFormat,
-    confirm_action,
+    campaign_countries,
+    campaign_currency,
+    campaign_daily_budget,
     enum_value,
+    format_bid_strategy,
     format_money,
+    format_money_obj,
     get_client,
     handle_api_error,
     output_data,
-    print_hint,
-    print_json,
+    print_error,
+    print_info,
     print_result_panel,
     print_success,
     print_warning,
@@ -27,172 +45,123 @@ from asa_api_cli.utils import (
 
 app = typer.Typer(help="Manage campaigns")
 
-CAMPAIGN_COLUMNS = [
-    "id",
-    "name",
-    "status",
-    "serving_status",
-    "daily_budget",
-    "countries",
-]
-
-CAMPAIGN_COLUMNS_WITH_SPEND = [
-    "id",
-    "name",
-    "status",
-    "serving_status",
-    "daily_budget",
-    "spend_7d",
-    "countries",
-]
-
-CAMPAIGN_COLUMN_LABELS = {
-    "id": "ID",
-    "serving_status": "Serving",
-    "daily_budget": "Daily Budget",
-    "spend_7d": "Spend (7d)",
-}
-
-
-def _colorize_status(status: str) -> str:
-    """Add color to status values."""
-    if status == "ENABLED":
-        return "[green]ENABLED[/green]"
-    elif status == "PAUSED":
-        return "[yellow]PAUSED[/yellow]"
-    return status
-
-
-def _colorize_serving(serving: str) -> str:
-    """Add color to serving status values."""
-    if serving == "RUNNING":
-        return "[green]RUNNING[/green]"
-    elif serving == "NOT_RUNNING":
-        return "[dim]NOT_RUNNING[/dim]"
-    return serving
-
-
-def campaign_to_dict(campaign: object, spend: str | None = None, colorize: bool = False) -> dict[str, Any]:
-    """Convert campaign to display dictionary."""
-    status = enum_value(campaign.status)  # type: ignore
-    serving_status = enum_value(campaign.serving_status)  # type: ignore
-
-    if colorize:
-        status = _colorize_status(status)
-        serving_status = _colorize_serving(serving_status)
-
-    result = {
-        "id": campaign.id,  # type: ignore
-        "name": campaign.name,  # type: ignore
-        "status": status,
-        "serving_status": serving_status,
-        "daily_budget": format_money(
-            campaign.daily_budget_amount.amount if campaign.daily_budget_amount else None,  # type: ignore
-            campaign.daily_budget_amount.currency if campaign.daily_budget_amount else None,  # type: ignore
-        ),
-        "countries": ", ".join(campaign.countries_or_regions[:3])  # type: ignore
-        + ("..." if len(campaign.countries_or_regions) > 3 else ""),  # type: ignore
-    }
-    if spend is not None:
-        result["spend_7d"] = spend
-    return result
+CAMPAIGN_COLUMNS = ["id", "name", "status", "serving_status", "daily_budget", "countries"]
 
 
 @app.command("list")
 def list_campaigns(
     status: Annotated[
         CampaignStatus | None,
-        typer.Option("--status", "-s", help="Filter by status (ENABLED or PAUSED)"),
+        typer.Option("--status", "-s", help="Filter by status (ENABLED, PAUSED)"),
     ] = None,
-    all_campaigns: Annotated[
-        bool,
-        typer.Option("--all", "-a", help="Show all campaigns including paused (default: enabled only)"),
-    ] = False,
-    with_spend: Annotated[
-        bool,
-        typer.Option("--with-spend", "-w", help="Include 7-day spend (slower - requires report API)"),
-    ] = False,
     limit: Annotated[
         int,
         typer.Option("--limit", "-l", help="Maximum number of results"),
     ] = 100,
+    with_spend: Annotated[
+        bool,
+        typer.Option("--with-spend", help="Include spend metrics"),
+    ] = False,
+    days: Annotated[
+        int,
+        typer.Option("--days", "-d", help="Days of spend data (with --with-spend)"),
+    ] = 30,
     format: Annotated[
         OutputFormat,
         typer.Option("--format", "-f", help="Output format"),
     ] = OutputFormat.TABLE,
 ) -> None:
-    """List campaigns.
-
-    By default, shows only ENABLED campaigns. Use --all to see paused campaigns too.
+    """List all campaigns.
 
     Examples:
-        asa campaigns list                    # Show enabled campaigns
-        asa campaigns list --all              # Show all campaigns
-        asa campaigns list --status PAUSED    # Show only paused campaigns
-        asa campaigns list --with-spend       # Include 7-day spend data
+        asa campaigns list
+        asa campaigns list --status ENABLED
+        asa campaigns list --with-spend --days 30
         asa campaigns list --format json
     """
     client = get_client()
 
     try:
         with client:
-            # Determine which status to filter by
-            filter_status = status
-            if filter_status is None and not all_campaigns:
-                filter_status = CampaignStatus.ENABLED
-
             with spinner("Fetching campaigns..."):
-                if filter_status:
-                    selector = Selector().where("status", "==", filter_status.value).limit(limit)
-                    campaigns = client.campaigns.find(selector)
-                else:
-                    campaigns = client.campaigns.list(limit=limit)
+                q = Query().page(size=limit, fetch_total_count=True)
+                if status:
+                    q = q.where("status", "EQUALS", status.value)
+                page = client.campaigns.query(q)
 
-            if not campaigns.data:
-                print_warning("No campaigns found")
+            if not page.result:
+                if format == OutputFormat.JSON:
+                    output_data([], CAMPAIGN_COLUMNS, format)
+                else:
+                    print_warning("No campaigns found")
                 return
 
-            # Get spend data if requested
-            spend_by_campaign: dict[int, str] = {}
+            spend_by_campaign: dict[int, tuple[Decimal, str]] = {}
             if with_spend:
-                with spinner("Fetching 7-day spend data..."):
-                    end = date.today()
-                    start = end - timedelta(days=7)
-                    report = client.reports.campaigns(start, end)
+                end_date = date.today() - timedelta(days=1)
+                start_date = end_date - timedelta(days=days - 1)
+                cids = [str(c.id) for c in page.result if c.id is not None]
 
-                    for row in report.row or []:
-                        if row.metadata and row.metadata.campaign_id and row.total:
-                            spend = row.total.local_spend
-                            if spend:
-                                spend_by_campaign[row.metadata.campaign_id] = f"{spend.amount} {spend.currency}"
+                with spinner(f"Fetching {days}-day spend data..."):
+                    try:
+                        req = AppsReportingRequest(
+                            filters=(
+                                [ReportFilter(field="id", operator=ReportFilterOperator.IN, value=cids)]
+                                if cids
+                                else None
+                            ),
+                            time_range=ReportTimeRange(
+                                start=start_date,
+                                end=end_date,
+                                granularity=ReportGranularity.DAILY,
+                            ),
+                        )
+                        for row in client.reports.iter_campaigns(req):
+                            if row.metadata and row.metadata.id is not None and row.total_metrics:
+                                ls = row.total_metrics.local_spend
+                                if ls and ls.amount is not None:
+                                    cid = row.metadata.id
+                                    default_spend = (Decimal("0"), ls.currency or "USD")
+                                    prev_amt, prev_curr = spend_by_campaign.get(cid, default_spend)
+                                    spend_by_campaign[cid] = (
+                                        prev_amt + Decimal(str(ls.amount)),
+                                        ls.currency or prev_curr,
+                                    )
+                    except AppleSearchAdsError:
+                        print_warning("Could not fetch spend data")
 
-            # Use colors for table output
-            use_colors = format == OutputFormat.TABLE
+            data = []
+            for c in page.result:
+                countries = campaign_countries(c)
+                budget = campaign_daily_budget(c)
+                serving = enum_value(c.display_status) or enum_value(c.system_status)
+                row_dict = {
+                    "id": c.id,
+                    "name": c.name or "-",
+                    "status": enum_value(c.status),
+                    "serving_status": serving,
+                    "daily_budget": format_money_obj(budget),
+                    "countries": ", ".join(countries[:3]) + ("..." if len(countries) > 3 else ""),
+                }
+                if with_spend:
+                    if c.id is not None and c.id in spend_by_campaign:
+                        amt, curr = spend_by_campaign[c.id]
+                        row_dict["spend"] = format_money(str(amt), curr)
+                    else:
+                        row_dict["spend"] = "-"
+                data.append(row_dict)
 
-            data = [
-                campaign_to_dict(
-                    c,
-                    spend=spend_by_campaign.get(c.id),
-                    colorize=use_colors,
-                )
-                for c in campaigns
-            ]
-
-            # Choose columns based on whether spend is included
-            columns = CAMPAIGN_COLUMNS_WITH_SPEND if with_spend else CAMPAIGN_COLUMNS
-
-            # Build title
-            status_label = filter_status.value if filter_status else "all"
-            title = f"Campaigns ({campaigns.total_results} {status_label})"
+            columns = [*CAMPAIGN_COLUMNS, "spend"] if with_spend else CAMPAIGN_COLUMNS
+            has_total = page.pagination and page.pagination.total_count is not None
+            total_count = page.pagination.total_count if page.pagination and has_total else len(page)
+            title = f"Campaigns ({total_count})" + (f" - {days}d spend" if with_spend else "")
 
             output_data(
                 data,
                 columns,
                 format,
                 title=title,
-                column_labels=CAMPAIGN_COLUMN_LABELS,
             )
-
     except AppleSearchAdsError as e:
         handle_api_error(e)
         raise typer.Exit(EXIT_ERROR) from None
@@ -204,27 +173,65 @@ def get_campaign(
     format: Annotated[
         OutputFormat,
         typer.Option("--format", "-f", help="Output format"),
-    ] = OutputFormat.JSON,
+    ] = OutputFormat.TABLE,
 ) -> None:
     """Get details for a specific campaign.
 
     Examples:
         asa campaigns get 123456789
-        asa campaigns get 123456789 --format table
+        asa campaigns get 123456789 --format json
     """
     client = get_client()
 
     try:
         with client:
-            with spinner("Fetching campaign..."):
-                campaign = client.campaigns.get(campaign_id)
+            with spinner(f"Fetching campaign {campaign_id}..."):
+                c = client.campaigns.get(campaign_id)
 
             if format == OutputFormat.JSON:
-                print_json(campaign, title=f"Campaign {campaign_id}")
-            else:
-                data = [campaign_to_dict(campaign)]
-                output_data(data, CAMPAIGN_COLUMNS, format, column_labels=CAMPAIGN_COLUMN_LABELS)
+                from asa_api_cli.utils import output_json
 
+                output_json(c)
+            else:
+                countries = campaign_countries(c)
+                budget = campaign_daily_budget(c)
+                supply_sources: list[str] = []
+                supply_placements: list[str] = []
+                if c.targeting:
+                    if c.targeting.supply_source and c.targeting.supply_source.include:
+                        supply_sources = [enum_value(s) for s in c.targeting.supply_source.include]
+                    if c.targeting.supply_placement and c.targeting.supply_placement.include:
+                        supply_placements = [enum_value(p) for p in c.targeting.supply_placement.include]
+
+                promoted = "-"
+                if c.promoted_object_id:
+                    ptype = enum_value(c.promoted_object_type)
+                    promoted = f"{c.promoted_object_id} ({ptype})" if ptype else c.promoted_object_id
+
+                shared_budget_ids = (
+                    ", ".join(str(sb.budget_id) for sb in c.shared_budgets if sb.budget_id is not None)
+                    if c.shared_budgets
+                    else "-"
+                )
+
+                print_result_panel(
+                    f"Campaign: {c.name}",
+                    {
+                        "ID": c.id,
+                        "Status": enum_value(c.status),
+                        "Display Status": enum_value(c.display_status) or "-",
+                        "System Status": enum_value(c.system_status) or "-",
+                        "Promoted Object": promoted,
+                        "Billing Event": enum_value(c.billing_event) or "-",
+                        "Daily Budget": format_money_obj(budget),
+                        "Shared Budgets": shared_budget_ids or "-",
+                        "Bid Strategy": format_bid_strategy(c.bid_strategy),
+                        "Countries": ", ".join(countries) if countries else "-",
+                        "Supply Sources": ", ".join(supply_sources) if supply_sources else "-",
+                        "Placements": ", ".join(supply_placements) if supply_placements else "-",
+                    },
+                    style="cyan",
+                )
     except AppleSearchAdsError as e:
         handle_api_error(e)
         raise typer.Exit(EXIT_ERROR) from None
@@ -234,7 +241,7 @@ def get_campaign(
 def pause_campaign(
     campaign_id: Annotated[int, typer.Argument(help="Campaign ID to pause")],
 ) -> None:
-    """Pause a campaign.
+    """Pause an active campaign.
 
     Examples:
         asa campaigns pause 123456789
@@ -243,14 +250,12 @@ def pause_campaign(
 
     try:
         with client:
-            with spinner("Pausing campaign..."):
-                campaign = client.campaigns.update(
+            with spinner(f"Pausing campaign {campaign_id}..."):
+                c = client.campaigns.update(
                     campaign_id,
-                    data=CampaignUpdate(status=CampaignStatus.PAUSED),
+                    CampaignUpdate(status=CampaignStatus.PAUSED),
                 )
-            print_success(f"Campaign '{campaign.name}' paused")
-            print_hint(f"asa campaigns get {campaign_id}")
-
+            print_success(f"Campaign '{c.name}' ({c.id}) paused")
     except AppleSearchAdsError as e:
         handle_api_error(e)
         raise typer.Exit(EXIT_ERROR) from None
@@ -269,14 +274,12 @@ def enable_campaign(
 
     try:
         with client:
-            with spinner("Enabling campaign..."):
-                campaign = client.campaigns.update(
+            with spinner(f"Enabling campaign {campaign_id}..."):
+                c = client.campaigns.update(
                     campaign_id,
-                    data=CampaignUpdate(status=CampaignStatus.ENABLED),
+                    CampaignUpdate(status=CampaignStatus.ENABLED),
                 )
-            print_success(f"Campaign '{campaign.name}' enabled")
-            print_hint(f"asa campaigns get {campaign_id}")
-
+            print_success(f"Campaign '{c.name}' ({c.id}) enabled")
     except AppleSearchAdsError as e:
         handle_api_error(e)
         raise typer.Exit(EXIT_ERROR) from None
@@ -285,54 +288,67 @@ def enable_campaign(
 @app.command("set-budget")
 def set_budget(
     campaign_id: Annotated[int, typer.Argument(help="Campaign ID")],
-    daily_budget: Annotated[
+    daily: Annotated[
         float | None,
         typer.Option("--daily", "-d", help="Daily budget amount"),
     ] = None,
-    total_budget: Annotated[
+    total: Annotated[
         float | None,
-        typer.Option("--total", "-t", help="Total budget amount"),
+        typer.Option(
+            "--total",
+            "-t",
+            help="[Removed in Platform API v1] Lifetime campaign budgets are no longer supported",
+        ),
     ] = None,
     currency: Annotated[
-        str,
-        typer.Option("--currency", "-c", help="Currency code"),
-    ] = "USD",
+        str | None,
+        typer.Option("--currency", "-c", help="Currency code (defaults to campaign currency or USD)"),
+    ] = None,
 ) -> None:
-    """Update campaign budget.
+    """Update campaign daily budget.
 
     Examples:
-        asa campaigns set-budget 123456789 --daily 100
-        asa campaigns set-budget 123456789 --daily 100 --total 10000
+        asa campaigns set-budget 123456789 --daily 50.00
         asa campaigns set-budget 123456789 --daily 100 --currency EUR
     """
-    if daily_budget is None and total_budget is None:
-        print_warning("Specify at least --daily or --total budget")
+    if total is not None:
+        print_error(
+            "Unsupported Option",
+            "Platform API v1 removed campaign-level lifetime budgets (--total).",
+            hint="Use --daily to set a daily budget, or inspect shared budgets via 'asa budget-orders'.",
+        )
+        raise typer.Exit(EXIT_USAGE)
+
+    if daily is None:
+        print_error(
+            "Missing Option",
+            "Specify --daily budget amount",
+            hint="Example: asa campaigns set-budget 123 --daily 50.00",
+        )
         raise typer.Exit(EXIT_USAGE)
 
     client = get_client()
 
     try:
         with client:
-            update = CampaignUpdate()
-            if daily_budget is not None:
-                update.daily_budget_amount = Money(amount=str(daily_budget), currency=currency)
-            if total_budget is not None:
-                update.budget_amount = Money(amount=str(total_budget), currency=currency)
+            resolved_currency = currency.upper() if currency else None
+            if not resolved_currency:
+                existing = client.campaigns.get(campaign_id)
+                resolved_currency = campaign_currency(existing)
 
-            with spinner("Updating budget..."):
-                campaign = client.campaigns.update(campaign_id, data=update)
+            update = CampaignUpdate(
+                daily_budget=DailyBudget(value=Money(amount=f"{daily:.2f}", currency=resolved_currency))
+            )
+            with spinner(f"Updating budget for campaign {campaign_id}..."):
+                c = client.campaigns.update(campaign_id, update)
 
-            result_data = {"Campaign": campaign.name}
-            if campaign.daily_budget_amount:
-                amt = campaign.daily_budget_amount
-                result_data["Daily Budget"] = f"{amt.amount} {amt.currency}"
-            if campaign.budget_amount:
-                amt = campaign.budget_amount
-                result_data["Total Budget"] = f"{amt.amount} {amt.currency}"
-
-            print_result_panel("Budget Updated", result_data)
-            print_hint(f"asa campaigns get {campaign_id}")
-
+            budget = campaign_daily_budget(c)
+            print_result_panel(
+                f"Budget Updated: {c.name}",
+                {
+                    "Daily Budget": format_money_obj(budget),
+                },
+            )
     except AppleSearchAdsError as e:
         handle_api_error(e)
         raise typer.Exit(EXIT_ERROR) from None
@@ -343,12 +359,10 @@ def delete_campaign(
     campaign_id: Annotated[int, typer.Argument(help="Campaign ID to delete")],
     force: Annotated[
         bool,
-        typer.Option("--force", "-f", help="Skip confirmation"),
+        typer.Option("--force", "-y", help="Skip confirmation prompt"),
     ] = False,
 ) -> None:
-    """Delete a campaign.
-
-    WARNING: This action cannot be undone.
+    """Delete a campaign permanently.
 
     Examples:
         asa campaigns delete 123456789
@@ -358,20 +372,18 @@ def delete_campaign(
 
     try:
         with client:
-            # Get campaign name for confirmation
-            with spinner("Fetching campaign..."):
-                campaign = client.campaigns.get(campaign_id)
+            c = client.campaigns.get(campaign_id)
 
             if not force:
-                if not confirm_action(f"Are you sure you want to delete campaign '{campaign.name}'?"):
-                    print_warning("Cancelled")
+                confirm = typer.confirm(f"Delete campaign '{c.name}' ({c.id})? This cannot be undone")
+                if not confirm:
+                    print_info("Cancelled")
                     raise typer.Exit(0)
 
-            with spinner("Deleting campaign..."):
+            with spinner(f"Deleting campaign {campaign_id}..."):
                 client.campaigns.delete(campaign_id)
 
-            print_success(f"Campaign '{campaign.name}' deleted")
-
+            print_success(f"Campaign '{c.name}' ({c.id}) deleted")
     except AppleSearchAdsError as e:
         handle_api_error(e)
         raise typer.Exit(EXIT_ERROR) from None

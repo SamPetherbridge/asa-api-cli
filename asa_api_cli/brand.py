@@ -1,4 +1,4 @@
-"""Brand campaign CLI commands.
+"""Brand campaign CLI commands for Apple Ads Platform API v1.
 
 This module provides the `brand` command for creating brand protection campaigns.
 """
@@ -9,29 +9,44 @@ from typing import Annotated, Any
 
 import typer
 from asa_api_client.exceptions import AppleSearchAdsError
-from asa_api_client.models import (
-    AdGroupCreate,
+from asa_api_client.v1.client import AppleAdsClient
+from asa_api_client.v1.models.ad_groups import AdGroupCreate, AdGroupStatus, PricingModel
+from asa_api_client.v1.models.base import Money
+from asa_api_client.v1.models.bulk import BulkKeywordCreate
+from asa_api_client.v1.models.campaigns import (
+    BillingEvent,
     CampaignCreate,
     CampaignStatus,
-    CampaignSupplySource,
-    KeywordCreate,
-    KeywordMatchType,
-    Money,
+    CampaignTargeting,
+    DailyBudget,
+    PromotedObjectType,
+    SupplyPlacement,
+    SupplySource,
 )
+from asa_api_client.v1.models.keywords import KeywordMatchType, KeywordStatus
+from asa_api_client.v1.models.shared import TargetingData
+from asa_api_client.v1.query import Query
 from rich.table import Table
 
 from asa_api_cli.optimize import CampaignNameParts, wait_for_resource
 from asa_api_cli.utils import (
     EXIT_ERROR,
     EXIT_USAGE,
+    ad_group_bid_money,
+    campaign_adam_id,
+    campaign_currency,
+    campaign_daily_budget,
     console,
+    enum_value,
     get_client,
     handle_api_error,
+    manual_cpt_bid_strategy,
     print_error,
     print_info,
     print_result_panel,
     print_success,
     print_warning,
+    require_id,
     spinner,
 )
 
@@ -40,7 +55,7 @@ app = typer.Typer(
     help="Create brand protection campaigns.",
 )
 
-# All 91 Apple Search Ads supported countries (as of December 2024)
+# All 91 Apple Ads supported countries
 # Organized by region for easier maintenance
 ALL_COUNTRIES = {
     # Africa, Middle East, and India (19)
@@ -165,14 +180,7 @@ COUNTRY_PRESETS = {
 
 
 def get_all_countries(include_china: bool = False) -> list[str]:
-    """Get all supported countries.
-
-    Args:
-        include_china: Whether to include China (requires special documentation).
-
-    Returns:
-        List of country codes.
-    """
+    """Get all supported countries."""
     countries = []
     for region_countries in ALL_COUNTRIES.values():
         for code in region_countries:
@@ -187,7 +195,6 @@ def get_country_count() -> int:
     return len(get_all_countries(include_china=False))
 
 
-# Country code to name mapping for display
 COUNTRY_NAMES = {
     "DZ": "Algeria",
     "AM": "Armenia",
@@ -298,18 +305,13 @@ class BrandCampaignPlan:
 
 
 def _select_countries_interactive(include_china: bool = False) -> list[str]:
-    """Interactive country selection.
-
-    Returns:
-        List of selected country codes.
-    """
+    """Interactive country selection."""
     from rich.rule import Rule
 
     console.print()
     console.print(Rule("Select Target Countries"))
     console.print()
 
-    # Show presets
     table = Table(title="Country Presets", show_header=True)
     table.add_column("#", style="dim", width=4)
     table.add_column("Preset")
@@ -335,28 +337,23 @@ def _select_countries_interactive(include_china: bool = False) -> list[str]:
 
     selection = typer.prompt("Select preset (1-6) or enter country codes").strip()
 
-    # Check if it's a preset number
     try:
         preset_idx = int(selection) - 1
         if 0 <= preset_idx < len(presets_list):
             preset_key = presets_list[preset_idx][0]
             if preset_key == "all":
-                countries = get_all_countries(include_china=include_china)
-            else:
-                countries = COUNTRY_PRESETS[preset_key].copy()
-            return countries
+                return get_all_countries(include_china=include_china)
+            return COUNTRY_PRESETS[preset_key].copy()
     except ValueError:
         pass
 
-    # Check if it's a preset name
     selection_lower = selection.lower()
     if selection_lower == "all":
         return get_all_countries(include_china=include_china)
     if selection_lower in COUNTRY_PRESETS:
         return COUNTRY_PRESETS[selection_lower].copy()
 
-    # Parse as comma-separated country codes
-    countries = []
+    countries: list[str] = []
     all_valid = get_all_countries(include_china=True)
 
     for code in selection.upper().replace(" ", "").split(","):
@@ -376,32 +373,42 @@ def _select_countries_interactive(include_china: bool = False) -> list[str]:
     return countries
 
 
-def _select_app_interactive(client: Any) -> tuple[int, str, str]:
-    """Interactive app selection.
-
-    Returns:
-        Tuple of (adam_id, app_name, currency).
-    """
+def _select_app_interactive(client: AppleAdsClient) -> tuple[int, str, str]:
+    """Interactive app selection returning ``(adam_id, app_name, currency)``."""
     console.print()
     print_info("Select an app to create brand campaigns for:")
 
     with spinner("Loading campaigns..."):
-        all_campaigns = client.campaigns.list()
+        all_campaigns = list(client.campaigns.iter_all())
 
-    # Group by adam_id to show unique apps
-    apps: dict[int, tuple[str, str]] = {}  # adam_id -> (app_name, currency)
-    for camp in all_campaigns.data:
-        if camp.adam_id and camp.adam_id not in apps:
-            parsed = CampaignNameParts.parse(camp.name)
-            name = parsed.app_name if parsed else camp.name.split(" - ")[0]
-            currency = camp.daily_budget_amount.currency if camp.daily_budget_amount else "USD"
-            apps[camp.adam_id] = (name, currency)
+    apps: dict[int, tuple[str, str]] = {}
+    for camp in all_campaigns:
+        aid = campaign_adam_id(camp)
+        if aid and aid not in apps:
+            camp_name = camp.name or f"App {aid}"
+            parsed = CampaignNameParts.parse(camp_name)
+            name = parsed.app_name if parsed else camp_name.split(" - ")[0]
+            currency = campaign_currency(camp)
+            apps[aid] = (name, currency)
 
     if not apps:
-        print_error("No apps", "No campaigns found to get app information from")
+        # Fallback to owned apps from App Store search + account currency
+        try:
+            account_currency = "USD"
+            if client.ad_account_id is not None:
+                acct = client.ad_accounts.get(int(client.ad_account_id))
+                account_currency = enum_value(acct.currency) or "USD"
+            owned = client.apps.search("", return_owned_apps=True, limit=50)
+            for app_info in owned.result:
+                if app_info.adam_id and app_info.adam_id not in apps:
+                    apps[app_info.adam_id] = (app_info.app_name or f"App {app_info.adam_id}", account_currency)
+        except AppleSearchAdsError:
+            pass
+
+    if not apps:
+        print_error("No apps", "No campaigns or owned apps found to get app information from")
         raise typer.Exit(EXIT_ERROR)
 
-    # Display apps
     table = Table(show_header=True)
     table.add_column("#", style="dim", width=4)
     table.add_column("App Name")
@@ -420,23 +427,15 @@ def _select_app_interactive(client: Any) -> tuple[int, str, str]:
         if 0 <= idx < len(app_list):
             adam_id, (app_name, currency) = app_list[idx]
             return adam_id, app_name, currency
-        else:
-            print_error("Invalid selection", f"Please enter 1-{len(app_list)}")
-            raise typer.Exit(EXIT_USAGE)
+        print_error("Invalid selection", f"Please enter 1-{len(app_list)}")
+        raise typer.Exit(EXIT_USAGE)
     except ValueError:
         print_error("Invalid selection", "Please enter a number")
-        raise typer.Exit(EXIT_USAGE)
+        raise typer.Exit(EXIT_USAGE) from None
 
 
 def _get_brand_keywords_interactive(brand_name: str | None = None) -> list[str]:
-    """Interactive brand keyword entry.
-
-    Args:
-        brand_name: Optional initial brand name.
-
-    Returns:
-        List of brand keywords.
-    """
+    """Interactive brand keyword entry."""
     console.print()
 
     if brand_name:
@@ -446,7 +445,6 @@ def _get_brand_keywords_interactive(brand_name: str | None = None) -> list[str]:
         brand = typer.prompt("Enter your brand name").strip()
         keywords = [brand.lower()]
 
-    # Ask for variants
     console.print()
     console.print("[dim]Enter brand name variants (common misspellings, abbreviations)[/dim]")
     console.print("[dim]Press Enter with no input when done[/dim]")
@@ -471,14 +469,9 @@ def _get_budget_bid_interactive(
     ref_bid: Decimal | None = None,
     ref_currency: str = "USD",
 ) -> tuple[Decimal, Decimal, str]:
-    """Interactive budget and bid entry.
-
-    Returns:
-        Tuple of (budget, bid, currency).
-    """
+    """Interactive budget and bid entry."""
     console.print()
 
-    # Budget
     default_budget = str(ref_budget) if ref_budget else "50.00"
     budget_input = typer.prompt(
         f"Daily budget per campaign ({ref_currency})",
@@ -486,7 +479,6 @@ def _get_budget_bid_interactive(
     )
     budget = Decimal(budget_input)
 
-    # Bid
     default_bid = f"{ref_bid:.2f}" if ref_bid else "1.00"
     bid_input = typer.prompt(
         f"Default bid ({ref_currency})",
@@ -548,7 +540,6 @@ def create_brand_campaigns(
     This creates single-keyword ad groups (SKAGs) for your brand name
     and variants, helping protect your brand from competitors.
     """
-    # Skip if a subcommand was invoked
     if ctx.invoked_subcommand is not None:
         return
     from rich.rule import Rule
@@ -557,9 +548,10 @@ def create_brand_campaigns(
 
     try:
         with client:
+            ad_account_id = int(client.ad_account_id or client.resolve_ad_account())
+
             # Step 1: Get brand keywords
             if brand_name or variants:
-                # Use provided arguments
                 all_keywords = [brand_name.lower()] if brand_name else []
                 if variants:
                     for v in variants:
@@ -567,7 +559,6 @@ def create_brand_campaigns(
                         if kw and kw not in all_keywords:
                             all_keywords.append(kw)
             else:
-                # Interactive mode
                 all_keywords = _get_brand_keywords_interactive()
 
             if not all_keywords:
@@ -610,18 +601,27 @@ def create_brand_campaigns(
             if reference_campaign:
                 with spinner("Loading reference campaign..."):
                     ref_camp = client.campaigns.get(reference_campaign)
-                    adam_id = ref_camp.adam_id
-                    parsed_name = CampaignNameParts.parse(ref_camp.name)
-                    app_name = parsed_name.app_name if parsed_name else ref_camp.name.split(" - ")[0]
+                    adam_id = campaign_adam_id(ref_camp)
+                    ref_name = ref_camp.name or f"Campaign {reference_campaign}"
+                    parsed_name = CampaignNameParts.parse(ref_name)
+                    app_name = parsed_name.app_name if parsed_name else ref_name.split(" - ")[0]
 
-                    if ref_camp.daily_budget_amount:
-                        ref_budget = Decimal(ref_camp.daily_budget_amount.amount)
-                        ref_currency = ref_camp.daily_budget_amount.currency
+                    budget_money = campaign_daily_budget(ref_camp)
+                    if budget_money and budget_money.amount is not None:
+                        ref_budget = Decimal(budget_money.amount)
+                        ref_currency = budget_money.currency or "USD"
+                    else:
+                        ref_currency = campaign_currency(ref_camp)
 
-                    # Get average bid from ad groups
-                    ad_groups = client.campaigns(reference_campaign).ad_groups.list()
-                    if ad_groups.data:
-                        bids = [Decimal(ag.default_bid_amount.amount) for ag in ad_groups.data if ag.default_bid_amount]
+                    ad_groups = list(
+                        client.ad_groups.iter_all(Query().where("campaignId", "EQUALS", reference_campaign))
+                    )
+                    if ad_groups:
+                        bids: list[Decimal] = []
+                        for ag in ad_groups:
+                            ag_bid = ad_group_bid_money(ag)
+                            if ag_bid and ag_bid.amount is not None:
+                                bids.append(Decimal(ag_bid.amount))
                         if bids:
                             ref_bid = Decimal(sum(bids) / len(bids))
 
@@ -633,25 +633,13 @@ def create_brand_campaigns(
                 adam_id, app_name, ref_currency = _select_app_interactive(client)
 
             if adam_id is None:
-                print_error("No app selected", "Cannot continue without an app")
+                print_error("No app selected", "Cannot continue without an App Store app (adamId)")
                 return
 
             # Step 4: Get budget and bid
-            if daily_budget is not None:
-                final_budget = Decimal(str(daily_budget))
-            elif ref_budget:
-                final_budget = ref_budget
-            else:
-                final_budget = None
+            final_budget = Decimal(str(daily_budget)) if daily_budget is not None else ref_budget
+            final_bid = Decimal(str(default_bid)) if default_bid is not None else ref_bid
 
-            if default_bid is not None:
-                final_bid = Decimal(str(default_bid))
-            elif ref_bid:
-                final_bid = ref_bid
-            else:
-                final_bid = None
-
-            # If not fully specified, prompt interactively
             if final_budget is None or final_bid is None:
                 final_budget, final_bid, ref_currency = _get_budget_bid_interactive(
                     ref_budget=final_budget,
@@ -661,12 +649,13 @@ def create_brand_campaigns(
 
             # Step 5: Build campaign plans
             campaign_plans: list[BrandCampaignPlan] = []
+            resolved_app_name = app_name or all_keywords[0].title()
 
             for country in target_countries:
-                campaign_name = f"{app_name} - {country} - Brand - EM"
+                campaign_name = f"{resolved_app_name} - {country} - Brand - EM"
                 campaign_plans.append(
                     BrandCampaignPlan(
-                        app_name=app_name or all_keywords[0].title(),
+                        app_name=resolved_app_name,
                         adam_id=adam_id,
                         country=country,
                         name=campaign_name,
@@ -682,21 +671,19 @@ def create_brand_campaigns(
             console.print(Rule("Brand Campaign Plan"))
             console.print()
 
-            console.print(f"[bold]App:[/bold] {app_name} (Adam ID: {adam_id})")
+            console.print(f"[bold]App:[/bold] {resolved_app_name} (Adam ID: {adam_id})")
             console.print(f"[bold]Keywords:[/bold] {', '.join(all_keywords)}")
             console.print(f"[bold]Daily Budget:[/bold] {final_budget} {ref_currency}")
             console.print(f"[bold]Default Bid:[/bold] {final_bid:.2f} {ref_currency}")
             console.print(f"[bold]Status:[/bold] {'PAUSED' if paused else 'ENABLED'}")
             console.print()
 
-            # Show summary table for many countries, detailed for few
             if len(campaign_plans) > 10:
                 console.print(f"[bold]Campaigns to create:[/bold] {len(campaign_plans)}")
                 console.print(f"[bold]Ad groups per campaign:[/bold] {len(all_keywords)}")
                 console.print(f"[bold]Total ad groups:[/bold] {len(campaign_plans) * len(all_keywords)}")
                 console.print()
 
-                # Group by region for display
                 console.print("[dim]Countries by region:[/dim]")
                 for region, codes in ALL_COUNTRIES.items():
                     region_countries = [c for c in target_countries if c in codes]
@@ -743,54 +730,57 @@ def create_brand_campaigns(
                 with spinner("Creating campaign..."):
                     new_campaign = client.campaigns.create(
                         CampaignCreate(
+                            ad_account_id=ad_account_id,
                             name=plan.name,
-                            adam_id=plan.adam_id,
-                            countries_or_regions=[plan.country],
-                            daily_budget_amount=Money(
-                                amount=str(plan.daily_budget),
-                                currency=plan.currency,
+                            billing_event=BillingEvent.TAPS,
+                            promoted_object_type=PromotedObjectType.APPSTORE_APP,
+                            promoted_object_id=str(plan.adam_id),
+                            daily_budget=DailyBudget(
+                                value=Money(amount=str(plan.daily_budget), currency=plan.currency),
                             ),
-                            supply_sources=[CampaignSupplySource.APPSTORE_SEARCH_RESULTS],
+                            targeting=CampaignTargeting(
+                                country_or_region=TargetingData(include=[plan.country]),
+                                supply_source=TargetingData(include=[SupplySource.APPSTORE.value]),
+                                supply_placement=TargetingData(include=[SupplyPlacement.APPSTORE_SEARCH_RESULTS.value]),
+                            ),
                             status=CampaignStatus.PAUSED if paused else CampaignStatus.ENABLED,
                         )
                     )
 
-                print_success(f"Created campaign (ID: {new_campaign.id})")
+                new_campaign_id = require_id(new_campaign.id, "Campaign")
+                print_success(f"Created campaign (ID: {new_campaign_id})")
                 created_campaigns += 1
 
-                # Wait for campaign to be available
-                def get_campaign(cid: int = new_campaign.id) -> Any:
+                def get_campaign(cid: int = new_campaign_id) -> Any:
                     return client.campaigns.get(cid)
 
                 wait_for_resource(get_campaign, max_attempts=10, delay=0.5)
 
-                # Create ad groups for each keyword
                 for keyword in plan.keywords:
                     ag_name = f"Exact - {keyword.title()}"[:200]
 
                     with spinner(f"  Creating: {ag_name}..."):
-                        new_ag = client.campaigns(new_campaign.id).ad_groups.create(
+                        new_ag = client.ad_groups.create(
                             AdGroupCreate(
+                                campaign_id=new_campaign_id,
                                 name=ag_name,
-                                default_bid_amount=Money(
-                                    amount=str(plan.default_bid),
-                                    currency=plan.currency,
-                                ),
+                                pricing_model=PricingModel.CPT,
+                                bid_strategy=manual_cpt_bid_strategy(plan.default_bid, plan.currency),
                                 automated_keywords_opt_in=False,
+                                status=AdGroupStatus.ENABLED,
                             )
                         )
+                        new_ag_id = require_id(new_ag.id, "Ad group")
                         created_ad_groups += 1
 
-                    # Create keyword (must use bulk endpoint)
-                    client.campaigns(new_campaign.id).ad_groups(new_ag.id).keywords.create_bulk(
+                    client.bulk.create_keywords(
                         [
-                            KeywordCreate(
+                            BulkKeywordCreate(
+                                ad_group_id=new_ag_id,
                                 text=keyword,
                                 match_type=KeywordMatchType.EXACT,
-                                bid_amount=Money(
-                                    amount=str(plan.default_bid),
-                                    currency=plan.currency,
-                                ),
+                                bid=Money(amount=str(plan.default_bid), currency=plan.currency),
+                                status=KeywordStatus.ENABLED,
                             )
                         ]
                     )
@@ -798,7 +788,6 @@ def create_brand_campaigns(
 
                     print_success(f"  {ag_name} → '{keyword}'")
 
-            # Summary
             console.print()
             print_result_panel(
                 "Brand Campaigns Created",

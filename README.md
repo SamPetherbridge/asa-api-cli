@@ -5,7 +5,7 @@
 [![License](https://img.shields.io/github/license/SamPetherbridge/asa-api-cli.svg)](https://github.com/SamPetherbridge/asa-api-cli/blob/main/LICENSE)
 [![CI](https://github.com/SamPetherbridge/asa-api-cli/actions/workflows/ci.yml/badge.svg)](https://github.com/SamPetherbridge/asa-api-cli/actions/workflows/ci.yml)
 
-A command-line interface for managing Apple Search Ads campaigns.
+A command-line interface for managing Apple Ads campaigns on the **Apple Ads Platform API v1**.
 
 Built on top of [asa-api-client](https://github.com/SamPetherbridge/asa-api-client).
 
@@ -37,128 +37,135 @@ pipx install asa-api-cli
 
 ## Setup
 
-Set up your Apple Search Ads API credentials:
+Configure your Apple Ads Platform API v1 OAuth2 credentials via environment variables or a `.env` file:
 
 ```bash
 export ASA_CLIENT_ID="SEARCHADS.your-client-id"
 export ASA_TEAM_ID="SEARCHADS.your-team-id"
 export ASA_KEY_ID="your-key-id"
-export ASA_ORG_ID="123456"
+export ASA_AD_ACCOUNT_ID="123456"
 export ASA_PRIVATE_KEY_PATH="/path/to/private-key.pem"
 ```
 
-Or use a `.env` file in your working directory.
-
-Test your credentials:
+If your API user only accesses a single ad account (or `ASA_ORG_ID` is set), `asa` will resolve the ad account automatically. For multi-account setups, discover accounts and override per command with `--ad-account` / `-A`:
 
 ```bash
+# List accessible ad accounts and roles
+asa auth accounts
+
+# Test Platform API v1 authentication
 asa auth test
+
+# Override the active ad account for any command
+asa --ad-account 123456 campaigns list
 ```
 
 ## Commands
 
-### Campaigns
+### Campaigns, Ad Groups, Keywords & Ads
 
 ```bash
-# List all enabled campaigns
+# List enabled campaigns (or --all, --with-spend, --json)
 asa campaigns list
-
-# List all campaigns (including paused)
-asa campaigns list --all
-
-# List with 7-day spend data
-asa campaigns list --with-spend
-
-# Get a specific campaign
+asa campaigns list --all --with-spend
 asa campaigns get 123456789
+asa campaigns set-budget 123456789 --daily 100.00 --currency USD
 
-# Output as JSON
-asa campaigns list --json
+# Manage ad groups (flat ad group IDs in Platform API v1)
+asa ad-groups list --campaign 123456789
+asa ad-groups get 987654321
+asa ad-groups set-bid 987654321 --bid 2.50
+asa ad-groups set-bid 987654321 --target-cpa 8.00
+
+# Manage keywords and negative keywords
+asa keywords list --ad-group 987654321
+asa keywords add "budget tracker" "expense app" --ad-group 987654321 --match EXACT --bid 2.00
+asa keywords negatives list --campaign 123456789
+
+# Manage ads and reusable creatives
+asa ads list --ad-group 987654321
+asa ads creatives --adam-id 654321987
+asa ads create --campaign 123456789 --ad-group 987654321 --name "Holiday CPP" \
+  --type CUSTOM_PRODUCT_PAGE --product-page pp-uuid
 ```
 
-### Ad Groups
+### Apps, Product Pages, Geo, Countries & Shared Budgets
 
 ```bash
-# List ad groups in a campaign
-asa ad-groups list 123456789
-```
+# App Store lookup, metadata, and ad placement eligibility
+asa apps search "habit tracker"
+asa apps get 654321987
+asa apps eligibilities 654321987
 
-### Keywords
+# Product pages (DPPs, CPPs, PPO variants) and localized metadata
+asa product-pages list --adam-id 654321987
+asa product-pages locales <page-id> --adam-id 654321987
+asa product-pages app-locales 654321987
 
-```bash
-# List keywords in an ad group
-asa keywords list 123456789 987654321
+# Geo targeting, supported storefronts/languages, and shared budgets
+asa geo search "New York" --country US
+asa countries list
+asa budget-orders list
 ```
 
 ### Reports
 
 ```bash
-# Campaign performance report
-asa reports campaigns --start 2024-01-01 --end 2024-01-31
-
-# Keyword report
-asa reports keywords 123456789 --start 2024-01-01 --end 2024-01-31
-
-# Export to CSV
-asa reports campaigns --start 2024-01-01 --end 2024-01-31 --output report.csv
+# Campaign, ad group, ad, keyword, and ORTZ search-term reports
+asa reports campaigns --start 2026-01-01 --end 2026-01-31
+asa reports ad-groups 123456789 --days 14
+asa reports ads 123456789 --days 14
+asa reports keywords 123456789 --days 30
+asa reports search-terms 123456789 --days 14 --output search-terms.csv
 ```
 
-### Analysis Workbook & Platform API v1 Smoke Test
+### Recommendations, Suggestions & Change History
 
 ```bash
-# Generate an Excel performance analysis workbook (requires [analyze] extra)
-asa analyze --period 30d --output asa-30d.xlsx
+# View, apply, or dismiss Apple Ads optimization recommendations
+asa recommendations target-cpas
+asa recommendations daily-budgets
+asa recommendations apply <rec-id> --type target-cpa
+asa recommendations dismiss <rec-id>
 
-# Run a read-only smoke test against the Apple Ads Platform API v1
-asa v1-smoke
+# Keyword, phrase, category, and Target CPA suggestions
+asa suggestions keywords --adam-id 654321987 --country US
+asa suggestions phrases --adam-id 654321987 --query-type SEARCH --phrase "budget planner"
+asa suggestions categories --adam-id 654321987
+asa suggestions target-cpa --adam-id 654321987 --country US
+
+# Account change history and field-level audit details
+asa change-history list --days 7
+asa change-history details Campaign.444555666.txn_abc123
 ```
 
-### Brand Campaigns
-
-Create brand protection campaigns for your app:
+### Impression Share & Search Popularity Insights
 
 ```bash
-# Interactive mode (recommended)
-asa brand
+# Daily/weekly search term impression share (synchronous v1 Insights API)
+asa impression-share analyze --country US --days 7
 
-# With arguments
-asa brand "My App Name" -v "My App" -c US -c GB
-
-# All standard countries
-asa brand "My App Name" --country all
-
-# Preview without creating
-asa brand "My App Name" -c US --dry-run
+# Weekly search term popularity index (1-5)
+asa impression-share popularity --country US --search "budget"
 ```
 
-### Campaign Expansion
-
-Expand existing campaigns to new markets:
+### Optimization, Brand Campaigns, Translation & Workbook Analysis
 
 ```bash
-# Interactive mode
-asa optimize expand
-
-# With filters
-asa optimize expand --type Generic --match EM
-
-# Preview
-asa optimize expand --dry-run
-```
-
-### Bid Optimization
-
-Check and fix bid discrepancies:
-
-```bash
-# Check bids
-asa optimize bid-check
-
-# Auto-fix discrepancies
-asa optimize bid-check --auto-fix
-
-# With threshold
+# Optimization workflows
 asa optimize bid-check --threshold 0.05
+asa optimize bid-review --days 30
+asa optimize cpa-impact
+asa optimize expand --type Generic --match EM --dry-run
+asa optimize negatives --days 30
+
+# Brand protection campaigns & multi-language keyword translation
+asa brand "My App Name" -c US -c GB --dry-run
+asa translate detect
+
+# Excel performance analysis workbook & Platform API v1 smoke test
+asa analyze --period 30d --output asa-30d.xlsx
+asa v1-smoke
 ```
 
 ## Shell Completion

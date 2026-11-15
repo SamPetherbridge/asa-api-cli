@@ -1,5 +1,6 @@
-"""Optimization CLI commands for campaign management."""
+"""Optimization CLI commands for Apple Ads Platform API v1."""
 
+import csv
 import time
 from collections import defaultdict
 from collections.abc import Callable
@@ -11,35 +12,70 @@ from typing import Annotated, Any, Literal, TypeVar
 
 import typer
 from asa_api_client.exceptions import AppleSearchAdsError, NotFoundError
-from asa_api_client.models import (
-    AdGroupCreate,
-    AdGroupUpdate,
+from asa_api_client.v1.models.ad_groups import AdGroupCreate, AdGroupStatus, AdGroupUpdate, PricingModel
+from asa_api_client.v1.models.base import Money
+from asa_api_client.v1.models.bulk import BulkKeywordCreate, BulkNegativeKeywordCreate
+from asa_api_client.v1.models.campaigns import (
+    BillingEvent,
+    Campaign,
     CampaignCreate,
     CampaignStatus,
-    CampaignSupplySource,
-    GranularityType,
-    KeywordCreate,
-    KeywordMatchType,
-    KeywordUpdate,
-    Money,
-    NegativeKeywordCreate,
-    Selector,
+    CampaignTargeting,
+    CampaignUpdate,
+    DailyBudget,
+    PromotedObjectType,
+    SupplyPlacement,
+    SupplySource,
 )
+from asa_api_client.v1.models.keywords import (
+    Keyword,
+    KeywordMatchType,
+    KeywordStatus,
+    KeywordUpdate,
+    NegativeKeywordStatus,
+)
+from asa_api_client.v1.models.recommendations import (
+    ApplyTargetCpaRecommendation,
+    RecommendationFilterCondition,
+    RecommendationFilterOperator,
+    RecommendationPromotedObjectType,
+    RecommendationQueryRequest,
+    RecommendationState,
+    TargetCpaRecommendation,
+)
+from asa_api_client.v1.models.reports import (
+    AppsReportingRequest,
+    ReportFilter,
+    ReportFilterOperator,
+    ReportGranularity,
+    ReportTimeRange,
+    ReportTimeZone,
+)
+from asa_api_client.v1.models.shared import BidStrategyType, TargetingData
+from asa_api_client.v1.query import Query
 from pydantic import BaseModel, Field
 from rich.table import Table
 
 from asa_api_cli.utils import (
     EXIT_ERROR,
+    ad_group_bid_money,
+    campaign_adam_id,
+    campaign_countries,
+    campaign_currency,
+    campaign_daily_budget,
     console,
     enum_value,
     get_client,
     handle_api_error,
+    manual_cpt_bid_strategy,
     print_error,
     print_info,
     print_result_panel,
     print_success,
     print_warning,
+    require_id,
     spinner,
+    target_cpa_bid_strategy,
 )
 
 app = typer.Typer(help="Optimization commands for campaigns")
@@ -52,19 +88,7 @@ def wait_for_resource(
     max_attempts: int = 10,
     delay: float = 0.5,
 ) -> T:
-    """Wait for a resource to become available by polling.
-
-    Args:
-        check_fn: Function that returns the resource or raises NotFoundError.
-        max_attempts: Maximum number of attempts before giving up.
-        delay: Delay in seconds between attempts.
-
-    Returns:
-        The resource once available.
-
-    Raises:
-        NotFoundError: If resource not available after max_attempts.
-    """
+    """Wait for a resource to become available by polling."""
     for attempt in range(max_attempts):
         try:
             return check_fn()
@@ -73,7 +97,6 @@ def wait_for_resource(
                 time.sleep(delay)
             else:
                 raise
-    # Should never reach here, but satisfy type checker
     raise NotFoundError("Resource not found after maximum attempts")
 
 
@@ -131,78 +154,78 @@ def check_bid_discrepancies(
         ),
     ] = False,
 ) -> None:
-    """Check for bid discrepancies between ad group and keyword levels.
-
-    Scans all enabled campaigns and ad groups, comparing the ad group default
-    bid to the average of keyword-level bids. Flags cases where keywords have
-    materially higher bids than the ad group default.
-
-    This is useful because when keyword bids are much higher than the ad group
-    default, it may indicate the ad group bid should be raised to improve
-    competitiveness for new keywords that inherit the default bid.
-
-    Examples:
-        asa optimize bid-check                    # Check with 20% threshold
-        asa optimize bid-check --threshold 50    # Flag only >50% differences
-        asa optimize bid-check --dry-run         # Preview without changes
-        asa optimize bid-check --auto-fix        # Apply all suggestions
-    """
+    """Check for bid discrepancies between MANUAL_CPT ad groups and keyword levels."""
     client = get_client()
     discrepancies: list[BidDiscrepancy] = []
 
     try:
         with client:
-            # Get all enabled campaigns
             with spinner("Scanning enabled campaigns..."):
-                campaigns = list(client.campaigns.find(Selector().where("status", "==", "ENABLED")))
+                campaigns = list(client.campaigns.iter_all(Query().where("status", "EQUALS", "ENABLED")))
 
             print_info(f"Found {len(campaigns)} enabled campaigns")
             console.print()
 
-            # Scan each campaign's ad groups
             for campaign in campaigns:
-                with spinner(f"Scanning {campaign.name}..."):
+                if campaign.id is None:
+                    continue
+                camp_name = campaign.name or str(campaign.id)
+                with spinner(f"Scanning {camp_name}..."):
                     try:
                         ad_groups = list(
-                            client.campaigns(campaign.id).ad_groups.find(Selector().where("status", "==", "ENABLED"))
+                            client.ad_groups.iter_all(
+                                Query().where("campaignId", "EQUALS", campaign.id).where("status", "EQUALS", "ENABLED")
+                            )
                         )
+                        kw_query = Query().where("campaignId", "EQUALS", campaign.id)
+                        all_keywords = list(client.keywords.iter_all(kw_query))
                     except AppleSearchAdsError:
-                        # Skip campaigns we can't access
                         continue
 
+                    keywords_by_ag: dict[int, list[Keyword]] = defaultdict(list)
+                    for kw in all_keywords:
+                        if kw.ad_group_id is not None:
+                            keywords_by_ag[kw.ad_group_id].append(kw)
+
                     for ag in ad_groups:
-                        # Get keywords for this ad group
-                        try:
-                            keywords = list(client.campaigns(campaign.id).ad_groups(ag.id).keywords.list())
-                        except AppleSearchAdsError:
+                        if ag.id is None:
+                            continue
+                        if ag.bid_strategy and enum_value(ag.bid_strategy.bid_strategy_type) not in (
+                            "",
+                            BidStrategyType.MANUAL_CPT.value,
+                        ):
+                            continue
+                        ag_bid_money = ad_group_bid_money(ag)
+                        if not ag_bid_money or ag_bid_money.amount is None:
                             continue
 
+                        keywords = keywords_by_ag.get(ag.id, [])
                         if not keywords:
                             continue
 
-                        # Calculate keyword bid statistics
-                        keyword_bids = [Decimal(kw.bid_amount.amount) for kw in keywords if kw.bid_amount]
-
+                        keyword_bids = [
+                            Decimal(kw.bid.amount)
+                            for kw in keywords
+                            if kw.bid and kw.bid.amount is not None and Decimal(kw.bid.amount) > 0
+                        ]
                         if not keyword_bids:
                             continue
 
-                        ad_group_bid = Decimal(ag.default_bid_amount.amount)
+                        ad_group_bid = Decimal(ag_bid_money.amount)
                         keyword_avg = Decimal(sum(keyword_bids) / len(keyword_bids))
                         keyword_min = min(keyword_bids)
                         keyword_max = max(keyword_bids)
-                        currency = ag.default_bid_amount.currency
+                        currency = ag_bid_money.currency or campaign_currency(campaign)
 
-                        # Check if there's a material discrepancy
-                        # (keywords are higher than ad group bid)
                         if ad_group_bid > 0:
                             diff_pct = float((keyword_avg - ad_group_bid) / ad_group_bid * 100)
                             if diff_pct >= threshold:
                                 discrepancies.append(
                                     BidDiscrepancy(
                                         campaign_id=campaign.id,
-                                        campaign_name=campaign.name,
+                                        campaign_name=camp_name,
                                         ad_group_id=ag.id,
-                                        ad_group_name=ag.name,
+                                        ad_group_name=ag.name or str(ag.id),
                                         ad_group_bid=ad_group_bid,
                                         keyword_avg_bid=keyword_avg,
                                         keyword_min_bid=keyword_min,
@@ -216,10 +239,8 @@ def check_bid_discrepancies(
                 print_success(f"No bid discrepancies found above {threshold}% threshold")
                 return
 
-            # Sort by difference percentage descending
             discrepancies.sort(key=lambda d: d.difference_pct, reverse=True)
 
-            # Display summary table
             console.print()
             table = Table(
                 title=f"Bid Discrepancies Found ({len(discrepancies)} ad groups)",
@@ -250,13 +271,11 @@ def check_bid_discrepancies(
                 print_info("Dry run mode - no changes will be made")
                 return
 
-            # Interactive mode - process each discrepancy
             changes_made = 0
             for i, d in enumerate(discrepancies, 1):
                 console.rule(f"[bold]{i}/{len(discrepancies)}")
                 console.print()
 
-                # Show details
                 console.print(f"[bold]Campaign:[/bold] {d.campaign_name}")
                 console.print(f"[bold]Ad Group:[/bold] {d.ad_group_name}")
                 console.print()
@@ -271,11 +290,8 @@ def check_bid_discrepancies(
                 suggested_bid = round(d.keyword_avg_bid, 2)
 
                 if auto_fix:
-                    # Apply suggested change without prompting
                     new_bid = suggested_bid
-                    action = "apply"
                 else:
-                    # Interactive prompt
                     console.print(f"[bold]Suggested new bid:[/bold] {_format_bid(suggested_bid, d.currency)}")
                     console.print()
 
@@ -287,39 +303,30 @@ def check_bid_discrepancies(
                         prompt_suffix=" [apply/custom/skip/quit]: ",
                     ).lower()
 
-                    if action == "quit" or action == "q":
+                    if action in ("quit", "q"):
                         print_info("Quitting...")
                         break
-                    elif action == "skip" or action == "s":
+                    if action in ("skip", "s"):
                         console.print("[dim]Skipped[/dim]")
                         console.print()
                         continue
-                    elif action == "custom" or action == "c":
-                        new_bid_str = typer.prompt(
-                            f"Enter new bid ({d.currency})",
-                            type=str,
-                        )
+                    if action in ("custom", "c"):
+                        new_bid_str = typer.prompt(f"Enter new bid ({d.currency})", type=str)
                         try:
                             new_bid = Decimal(new_bid_str)
                         except Exception:
                             print_warning("Invalid bid amount, skipping")
                             continue
-                    elif action == "apply" or action == "a":
+                    elif action in ("apply", "a"):
                         new_bid = suggested_bid
                     else:
                         print_warning(f"Unknown action '{action}', skipping")
                         continue
 
-                # Apply the change
                 with spinner("Updating ad group bid..."):
-                    client.campaigns(d.campaign_id).ad_groups.update(
+                    client.ad_groups.update(
                         d.ad_group_id,
-                        data=AdGroupUpdate(
-                            default_bid_amount=Money(
-                                amount=str(new_bid),
-                                currency=d.currency,
-                            )
-                        ),
+                        AdGroupUpdate(bid_strategy=manual_cpt_bid_strategy(new_bid, d.currency)),
                     )
 
                 print_success(
@@ -328,7 +335,6 @@ def check_bid_discrepancies(
                 changes_made += 1
                 console.print()
 
-            # Summary
             console.print()
             if changes_made > 0:
                 print_result_panel(
@@ -353,8 +359,8 @@ class KeywordPlan:
     text: str
     bid: Decimal
     currency: str
-    source_count: int  # Number of source campaigns this keyword appeared in
-    impressions: int = 0  # Total impressions in last 90 days
+    source_count: int
+    impressions: int = 0
     source_bids: list[Decimal] = field(default_factory=list)
 
 
@@ -385,23 +391,17 @@ class CampaignNameParts:
 
     app_name: str
     country: str
-    campaign_type: str  # Generic, Competitor, Brand
-    match_type: str  # EM (Exact Match), BM (Broad Match)
+    campaign_type: str
+    match_type: str
     original: str
 
     @classmethod
     def parse(cls, name: str) -> "CampaignNameParts | None":
-        """Parse campaign name in format: App Name - Country - Type - Match.
-
-        Examples:
-            'Chippy Tools - US - Generic - Exact Match' -> parts
-            'Concrete Tools - AU - Competitor - EM' -> parts
-        """
+        """Parse campaign name in format: App Name - Country - Type - Match."""
         parts = [p.strip() for p in name.split(" - ")]
         if len(parts) < 4:
             return None
 
-        # Last part is match type
         match_type_raw = parts[-1].upper()
         if match_type_raw in ("EM", "EXACT MATCH"):
             match_type = "EM"
@@ -410,13 +410,8 @@ class CampaignNameParts:
         else:
             return None
 
-        # Second to last is campaign type
         campaign_type = parts[-2]
-
-        # Second part is country (could be multi-letter code)
         country = parts[1].upper()
-
-        # Everything before country is app name
         app_name = parts[0]
 
         return cls(
@@ -434,27 +429,18 @@ class CampaignNameParts:
 
 
 def _select_campaigns_interactive(
-    campaigns: list[Any],
+    campaigns: list[Campaign],
     campaign_type_filter: str | None = None,
     match_type_filter: str | None = None,
-) -> list[Any]:
-    """Interactive campaign selection with checkboxes.
-
-    Args:
-        campaigns: List of Campaign objects
-        campaign_type_filter: Filter by type (Generic, Competitor, Brand)
-        match_type_filter: Filter by match type (EM, BM)
-
-    Returns:
-        List of selected Campaign objects
-    """
-    # Parse and filter campaigns
-    parsed_campaigns: list[tuple[Any, CampaignNameParts]] = []
+) -> list[Campaign]:
+    """Interactive campaign selection."""
+    parsed_campaigns: list[tuple[Campaign, CampaignNameParts]] = []
 
     for c in campaigns:
+        if not c.name:
+            continue
         parsed = CampaignNameParts.parse(c.name)
         if parsed:
-            # Apply filters
             if campaign_type_filter and parsed.campaign_type.lower() != campaign_type_filter.lower():
                 continue
             if match_type_filter and parsed.match_type != match_type_filter.upper():
@@ -464,12 +450,10 @@ def _select_campaigns_interactive(
     if not parsed_campaigns:
         return []
 
-    # Group by app name for easier selection
-    apps: dict[str, list[tuple[Any, CampaignNameParts]]] = defaultdict(list)
+    apps: dict[str, list[tuple[Campaign, CampaignNameParts]]] = defaultdict(list)
     for c, parsed in parsed_campaigns:
         apps[parsed.app_name].append((c, parsed))
 
-    # Display selection table
     console.print()
     console.print("[bold]Available campaigns:[/bold]")
     console.print()
@@ -483,14 +467,13 @@ def _select_campaigns_interactive(
     table.add_column("Status")
     table.add_column("ID", style="dim")
 
-    campaign_list: list[tuple[Any, CampaignNameParts]] = []
+    campaign_list: list[tuple[Campaign, CampaignNameParts]] = []
     idx = 1
     sorted_apps = sorted(apps.keys())
     for app_idx, app_name in enumerate(sorted_apps):
         app_campaigns = sorted(apps[app_name], key=lambda x: (x[1].campaign_type, x[1].country))
         last_type = None
-        for _camp_idx, (c, parsed) in enumerate(app_campaigns):
-            # Add a dim divider row between campaign types (within same app)
+        for c, parsed in app_campaigns:
             if last_type is not None and parsed.campaign_type != last_type:
                 table.add_row(
                     "[dim]·[/dim]",
@@ -504,7 +487,8 @@ def _select_campaigns_interactive(
                 )
 
             campaign_list.append((c, parsed))
-            status_color = "green" if enum_value(c.status) == "ENABLED" else "yellow"
+            status_str = enum_value(c.status)
+            status_color = "green" if status_str == "ENABLED" else "yellow"
 
             table.add_row(
                 str(idx),
@@ -512,33 +496,30 @@ def _select_campaigns_interactive(
                 parsed.country,
                 parsed.campaign_type,
                 parsed.match_type,
-                f"[{status_color}]{enum_value(c.status)}[/{status_color}]",
+                f"[{status_color}]{status_str}[/{status_color}]",
                 str(c.id),
             )
             idx += 1
             last_type = parsed.campaign_type
-        # Add section divider after each app group (except the last one)
         if app_idx < len(sorted_apps) - 1:
             table.add_section()
 
     console.print(table)
     console.print()
 
-    # Get selection
     console.print("[dim]Enter campaign numbers separated by commas, ranges (1-3), or 'all'[/dim]")
     selection = typer.prompt("Select campaigns", default="all")
 
     if selection.lower() == "all":
         return [c for c, _ in campaign_list]
 
-    # Parse selection (e.g., "1,2,5-7,10")
     selected_indices: set[int] = set()
     for part in selection.split(","):
         part = part.strip()
         if "-" in part:
             try:
-                start, end = part.split("-")
-                selected_indices.update(range(int(start), int(end) + 1))
+                start_s, end_s = part.split("-")
+                selected_indices.update(range(int(start_s), int(end_s) + 1))
             except ValueError:
                 continue
         else:
@@ -589,63 +570,26 @@ def expand_campaign(
         typer.Option("--paused", "-p", help="Create campaign in PAUSED state"),
     ] = False,
 ) -> None:
-    """Expand campaigns to a new market.
-
-    Creates a new SKAG (Single Keyword Ad Group) campaign in a target market
-    based on one or more source campaigns. Keywords are extracted from all
-    source campaigns and bids are averaged if a keyword appears in multiple sources.
-
-    Campaign naming follows: App Name - Country - Type - Match Type
-    Where Match Type is EM (Exact Match) or BM (Broad Match).
-
-    Structure created:
-    - One ad group per keyword (named "Exact - {keyword}")
-    - Each ad group contains one exact match keyword
-    - Cross-negatives: each keyword is added as exact negative to all other ad groups
-
-    Examples:
-        # Interactive mode - select campaigns and enter country
-        asa optimize expand
-
-        # Interactive with filters
-        asa optimize expand --type Generic --match EM
-
-        # Non-interactive with campaign IDs
-        asa optimize expand 123456789 --country CA
-
-        # Multiple campaigns (bids will be averaged)
-        asa optimize expand 123 456 789 --country CA
-
-        # Custom name and budget
-        asa optimize expand 123 --country DE --name "My App - DE - Generic" --budget 50
-
-        # Preview without creating
-        asa optimize expand --country CA --dry-run
-
-        # Create paused (for review before enabling)
-        asa optimize expand --country CA --paused
-    """
+    """Expand SKAG campaigns to a new market."""
     client = get_client()
 
     try:
         with client:
-            # Step 1: Get source campaigns (interactive or from arguments)
-            source_campaign_data = []
+            ad_account_id = int(client.ad_account_id or client.resolve_ad_account())
+            source_campaign_data: list[Campaign] = []
 
             if source_campaigns:
-                # Non-interactive: load specified campaign IDs
                 with spinner("Loading source campaigns..."):
-                    for campaign_id in source_campaigns:
+                    for cid in source_campaigns:
                         try:
-                            campaign = client.campaigns.get(campaign_id)
+                            campaign = client.campaigns.get(cid)
                             source_campaign_data.append(campaign)
                         except AppleSearchAdsError as e:
-                            print_error("Error", f"Could not load campaign {campaign_id}: {e.message}")
+                            print_error("Error", f"Could not load campaign {cid}: {e.message}")
                             raise typer.Exit(EXIT_ERROR) from None
             else:
-                # Interactive: show all campaigns and let user select
                 with spinner("Loading campaigns..."):
-                    all_campaigns = list(client.campaigns.list())
+                    all_campaigns = list(client.campaigns.iter_all())
 
                 source_campaign_data = _select_campaigns_interactive(
                     all_campaigns,
@@ -657,31 +601,26 @@ def expand_campaign(
                 print_error("Error", "No campaigns selected")
                 raise typer.Exit(EXIT_ERROR)
 
-            # Display selected source campaigns
             console.print()
             print_info(f"Selected source campaigns ({len(source_campaign_data)}):")
             for c in source_campaign_data:
-                countries = ", ".join(c.countries_or_regions[:3])
-                if len(c.countries_or_regions) > 3:
-                    countries += "..."
-                console.print(f"  • {c.name} ({countries})")
+                ctries = campaign_countries(c)
+                countries_str = ", ".join(ctries[:3])
+                if len(ctries) > 3:
+                    countries_str += "..."
+                console.print(f"  • {c.name} ({countries_str})")
             console.print()
 
-            # Step 2: Get target country (interactive if not provided)
             if not target_country:
                 target_country = typer.prompt("Target country code (e.g., CA, DE, FR)")
             target_country = target_country.upper() if target_country else ""
 
-            # Get adam_id and currency from first source
-            adam_id = source_campaign_data[0].adam_id
-            currency = (
-                source_campaign_data[0].daily_budget_amount.currency
-                if source_campaign_data[0].daily_budget_amount
-                else "USD"
-            )
+            adam_id = campaign_adam_id(source_campaign_data[0])
+            if adam_id is None:
+                print_error("Error", "Source campaign does not promote an App Store app (adamId missing)")
+                raise typer.Exit(EXIT_ERROR)
+            currency = campaign_currency(source_campaign_data[0])
 
-            # Step 2: Extract keywords with impressions from last 90 days
-            # Use reports API to get keywords that have actually had impressions
             keyword_bids: dict[str, list[Decimal]] = defaultdict(list)
             keyword_impressions: dict[str, int] = defaultdict(int)
 
@@ -689,36 +628,41 @@ def expand_campaign(
             start_date = end_date - timedelta(days=90)
 
             for campaign in source_campaign_data:
+                if campaign.id is None:
+                    continue
                 with spinner(f"Fetching keyword performance for {campaign.name} (90 days)..."):
                     try:
-                        # Get keyword report for last 90 days
-                        report = client.reports.keywords(
-                            campaign_id=campaign.id,
-                            start_date=start_date,
-                            end_date=end_date,
-                            granularity=GranularityType.DAILY,
+                        req = AppsReportingRequest(
+                            filters=[
+                                ReportFilter(
+                                    field="campaignId",
+                                    operator=ReportFilterOperator.EQUALS,
+                                    value=str(campaign.id),
+                                )
+                            ],
+                            time_range=ReportTimeRange(
+                                start=start_date,
+                                end=end_date,
+                                time_zone=ReportTimeZone.UTC,
+                                granularity=ReportGranularity.DAILY,
+                            ),
                         )
-
-                        for row in report.row:
-                            if row.metadata.keyword and row.total:
-                                kw_text = row.metadata.keyword.lower()
-                                impressions = row.total.impressions
-
-                                # Only include keywords with impressions
+                        for row in client.reports.iter_keywords(req):
+                            if row.metadata and row.metadata.text and row.total_metrics:
+                                kw_text = row.metadata.text.lower()
+                                impressions = row.total_metrics.impressions or 0
                                 if impressions > 0:
                                     keyword_impressions[kw_text] += impressions
-
-                                    # Get bid from report metadata or use a default
-                                    if row.metadata.bid_amount:
-                                        keyword_bids[kw_text].append(Decimal(row.metadata.bid_amount.amount))
-
+                                    if row.metadata.bid and row.metadata.bid.amount is not None:
+                                        keyword_bids[kw_text].append(Decimal(row.metadata.bid.amount))
+                                    else:
+                                        keyword_bids.setdefault(kw_text, [Decimal("1.00")])
                     except AppleSearchAdsError as e:
                         print_warning(f"Could not get report for {campaign.name}: {e.message}")
                         continue
 
-            # Filter to only keywords that had impressions
             active_keywords = set(keyword_impressions.keys())
-            keyword_bids = {k: v for k, v in keyword_bids.items() if k in active_keywords}
+            keyword_bids = {k: v for k, v in keyword_bids.items() if k in active_keywords and v}
 
             if not keyword_bids:
                 print_error("Error", "No keywords with impressions found in last 90 days")
@@ -727,7 +671,6 @@ def expand_campaign(
             total_impressions = sum(keyword_impressions.values())
             print_info(f"Found {len(keyword_bids)} keywords with {total_impressions:,} impressions in last 90 days")
 
-            # Step 3: Calculate average bids
             keyword_plans: list[KeywordPlan] = []
             for text, bids in keyword_bids.items():
                 avg_bid = Decimal(sum(bids) / len(bids))
@@ -742,55 +685,35 @@ def expand_campaign(
                     )
                 )
 
-            # Sort by impressions descending (most popular keywords first)
             keyword_plans.sort(key=lambda k: k.impressions, reverse=True)
             console.print()
 
-            # Step 4: Build campaign plan
-            # Generate campaign name using parsed naming convention
+            first_name = source_campaign_data[0].name or "Campaign"
             if campaign_name:
                 plan_name = campaign_name
             else:
-                # Try to parse first source campaign name and generate new name
-                parsed = CampaignNameParts.parse(source_campaign_data[0].name)
-                if parsed:
-                    plan_name = parsed.with_country(target_country)
-                else:
-                    # Fallback for campaigns that don't match the pattern
-                    plan_name = f"{source_campaign_data[0].name} - {target_country}"
+                parsed = CampaignNameParts.parse(first_name)
+                plan_name = parsed.with_country(target_country) if parsed else f"{first_name} - {target_country}"
 
-            # Use provided budget or average from sources
             if daily_budget is not None:
                 plan_budget = Decimal(str(daily_budget))
             else:
-                source_budgets = [
-                    Decimal(c.daily_budget_amount.amount) for c in source_campaign_data if c.daily_budget_amount
-                ]
-                if source_budgets:
-                    plan_budget = Decimal(sum(source_budgets) / len(source_budgets))
-                else:
-                    plan_budget = Decimal("100")
+                source_budgets: list[Decimal] = []
+                for c in source_campaign_data:
+                    bm = campaign_daily_budget(c)
+                    if bm and bm.amount is not None:
+                        source_budgets.append(Decimal(bm.amount))
+                plan_budget = Decimal(sum(source_budgets) / len(source_budgets)) if source_budgets else Decimal("100")
 
-            # Create ad group plans (SKAG structure)
             ad_group_plans: list[AdGroupPlan] = []
             all_keywords = [kp.text for kp in keyword_plans]
 
             for kp in keyword_plans:
-                # Ad group name: "Exact - {keyword}"
                 ag_name = f"Exact - {kp.text.title()}"
                 if len(ag_name) > 200:
                     ag_name = ag_name[:197] + "..."
-
-                # Cross-negatives: all other keywords
                 negatives = [k for k in all_keywords if k != kp.text] if not skip_negatives else []
-
-                ad_group_plans.append(
-                    AdGroupPlan(
-                        name=ag_name,
-                        keyword=kp,
-                        negatives=negatives,
-                    )
-                )
+                ad_group_plans.append(AdGroupPlan(name=ag_name, keyword=kp, negatives=negatives))
 
             campaign_plan = CampaignPlan(
                 name=plan_name,
@@ -801,12 +724,10 @@ def expand_campaign(
                 ad_groups=ad_group_plans,
             )
 
-            # Step 5: Display plan
             console.print()
             console.rule("[bold]Campaign Plan")
             console.print()
 
-            # Campaign overview
             table = Table(show_header=False, box=None)
             table.add_column("Label", style="bold")
             table.add_column("Value")
@@ -821,7 +742,6 @@ def expand_campaign(
             console.print(table)
             console.print()
 
-            # Ad group details
             console.print("[bold]Ad Groups & Keywords (sorted by impressions):[/bold]")
             console.print()
 
@@ -832,7 +752,7 @@ def expand_campaign(
             ag_table.add_column("Bid", justify="right")
             ag_table.add_column("Impr (90d)", justify="right")
 
-            for i, ag in enumerate(campaign_plan.ad_groups[:20], 1):  # Show first 20
+            for i, ag in enumerate(campaign_plan.ad_groups[:20], 1):
                 ag_table.add_row(
                     str(i),
                     ag.name[:30] + ("..." if len(ag.name) > 30 else ""),
@@ -857,39 +777,41 @@ def expand_campaign(
                 print_info("Dry run mode - no changes will be made")
                 return
 
-            # Step 6: Confirm and create
             if not typer.confirm("Create this campaign?", default=True):
                 print_info("Cancelled")
                 return
 
             console.print()
 
-            # Create campaign
             with spinner("Creating campaign..."):
                 new_campaign = client.campaigns.create(
                     CampaignCreate(
+                        ad_account_id=ad_account_id,
                         name=campaign_plan.name,
-                        adam_id=campaign_plan.adam_id,
-                        countries_or_regions=[campaign_plan.country],
-                        daily_budget_amount=Money(
-                            amount=str(campaign_plan.daily_budget),
-                            currency=campaign_plan.currency,
+                        billing_event=BillingEvent.TAPS,
+                        promoted_object_type=PromotedObjectType.APPSTORE_APP,
+                        promoted_object_id=str(campaign_plan.adam_id),
+                        daily_budget=DailyBudget(
+                            value=Money(amount=str(campaign_plan.daily_budget), currency=campaign_plan.currency),
                         ),
-                        supply_sources=[CampaignSupplySource.APPSTORE_SEARCH_RESULTS],
+                        targeting=CampaignTargeting(
+                            country_or_region=TargetingData(include=[campaign_plan.country]),
+                            supply_source=TargetingData(include=[SupplySource.APPSTORE.value]),
+                            supply_placement=TargetingData(include=[SupplyPlacement.APPSTORE_SEARCH_RESULTS.value]),
+                        ),
                         status=CampaignStatus.PAUSED if paused else CampaignStatus.ENABLED,
                     )
                 )
 
-            print_success(f"Created campaign: {new_campaign.name} (ID: {new_campaign.id})")
+            new_campaign_id = require_id(new_campaign.id, "Campaign")
+            print_success(f"Created campaign: {new_campaign.name} (ID: {new_campaign_id})")
 
-            # Wait for campaign to be available
             wait_for_resource(
-                lambda: client.campaigns.get(new_campaign.id),
+                lambda: client.campaigns.get(new_campaign_id),
                 max_attempts=10,
                 delay=0.5,
             )
 
-            # Create ad groups with keywords and negatives
             created_ad_groups = 0
             created_keywords = 0
             created_negatives = 0
@@ -897,60 +819,57 @@ def expand_campaign(
             print_info(f"Creating {len(campaign_plan.ad_groups)} ad groups...")
 
             for i, ag_plan in enumerate(campaign_plan.ad_groups, 1):
-                # Create ad group
                 with spinner(f"[{i}/{len(campaign_plan.ad_groups)}] Creating ad group: {ag_plan.name[:30]}..."):
-                    new_ag = client.campaigns(new_campaign.id).ad_groups.create(
+                    new_ag = client.ad_groups.create(
                         AdGroupCreate(
+                            campaign_id=new_campaign_id,
                             name=ag_plan.name,
-                            default_bid_amount=Money(
-                                amount=str(ag_plan.keyword.bid),
-                                currency=ag_plan.keyword.currency,
-                            ),
+                            pricing_model=PricingModel.CPT,
+                            bid_strategy=manual_cpt_bid_strategy(ag_plan.keyword.bid, ag_plan.keyword.currency),
                             automated_keywords_opt_in=False,
+                            status=AdGroupStatus.ENABLED,
                         )
                     )
+                    new_ag_id = require_id(new_ag.id, "Ad group")
                     created_ad_groups += 1
 
-                print_success(f"[{i}/{len(campaign_plan.ad_groups)}] Created ad group: {new_ag.name} (ID: {new_ag.id})")
+                print_success(f"[{i}/{len(campaign_plan.ad_groups)}] Created ad group: {new_ag.name} (ID: {new_ag_id})")
 
-                # Create keyword (must use bulk endpoint)
-                client.campaigns(new_campaign.id).ad_groups(new_ag.id).keywords.create_bulk(
+                client.bulk.create_keywords(
                     [
-                        KeywordCreate(
+                        BulkKeywordCreate(
+                            ad_group_id=new_ag_id,
                             text=ag_plan.keyword.text,
                             match_type=KeywordMatchType.EXACT,
-                            bid_amount=Money(
-                                amount=str(ag_plan.keyword.bid),
-                                currency=ag_plan.keyword.currency,
-                            ),
+                            bid=Money(amount=str(ag_plan.keyword.bid), currency=ag_plan.keyword.currency),
+                            status=KeywordStatus.ENABLED,
                         )
                     ]
                 )
                 created_keywords += 1
 
-                # Create negative keywords (bulk for efficiency)
                 if ag_plan.negatives:
                     try:
-                        neg_keywords = [
-                            NegativeKeywordCreate(
+                        neg_items = [
+                            BulkNegativeKeywordCreate(
+                                campaign_id=new_campaign_id,
+                                ad_group_id=new_ag_id,
                                 text=neg_text,
                                 match_type=KeywordMatchType.EXACT,
+                                status=NegativeKeywordStatus.ENABLED,
                             )
                             for neg_text in ag_plan.negatives
                         ]
-                        neg_resource = client.campaigns(new_campaign.id).ad_groups(new_ag.id).negative_keywords
-                        result = neg_resource.create_bulk(neg_keywords)
-                        created_negatives += len(result.data)
+                        results = client.bulk.create_negative_keywords(neg_items, allow_partial_success=True)
+                        created_negatives += sum(1 for r in results if r.success)
                     except AppleSearchAdsError:
-                        # Skip if negative keyword creation fails
                         pass
 
-            # Summary
             console.print()
             print_result_panel(
                 "Campaign Created Successfully",
                 {
-                    "Campaign ID": str(new_campaign.id),
+                    "Campaign ID": str(new_campaign_id),
                     "Campaign Name": new_campaign.name,
                     "Target Country": campaign_plan.country,
                     "Ad Groups": str(created_ad_groups),
@@ -981,31 +900,23 @@ class KeywordBidAnalysis:
     taps: int
     conversions: int
     spend: Decimal
-    avg_cpt: Decimal | None  # Average cost per tap
-    ttr: float | None  # Tap-through rate
-    cr: float | None  # Conversion rate
+    avg_cpt: Decimal | None
+    ttr: float | None
+    cr: float | None
     country: str
+    suggested_bid: Decimal | None = None
 
     @property
     def bid_strength(self) -> str:
-        """Estimate bid strength based on performance metrics.
-
-        Since Apple doesn't expose bidStrength via API, we estimate:
-        - STRONG: High impressions, good TTR
-        - MODERATE: Decent impressions, average TTR
-        - WEAK: Low impressions or poor TTR
-        """
+        """Estimate bid strength based on performance metrics."""
         if self.impressions == 0:
             return "UNKNOWN"
-
-        # Calculate TTR if we have data
         ttr = self.ttr or 0
-
         if self.impressions >= 1000 and ttr >= 0.05:
             return "STRONG"
-        elif self.impressions >= 100 and ttr >= 0.02:
+        if self.impressions >= 100 and ttr >= 0.02:
             return "MODERATE"
-        elif self.impressions > 0:
+        if self.impressions > 0:
             return "WEAK"
         return "UNKNOWN"
 
@@ -1015,9 +926,9 @@ class KeywordBidAnalysis:
         strength = self.bid_strength
         if strength == "STRONG":
             return "Consider increase for more volume"
-        elif strength == "MODERATE":
+        if strength == "MODERATE":
             return "Monitor performance"
-        elif strength == "WEAK":
+        if strength == "WEAK":
             return "Increase bid or review keyword"
         return "Need more data"
 
@@ -1053,24 +964,7 @@ def review_keyword_bids(
         typer.Option("--interactive", "-i", help="Interactive mode to adjust bids"),
     ] = False,
 ) -> None:
-    """Review keyword bids and their performance.
-
-    Analyzes keyword performance metrics (impressions, taps, conversions)
-    to estimate bid strength and suggest optimizations.
-
-    Since Apple doesn't expose bidStrength via API, this command estimates
-    it based on:
-    - Impression volume (higher = stronger bid)
-    - Tap-through rate (higher = better relevance/position)
-    - Conversion metrics
-
-    Examples:
-        asa optimize bid-review --country US
-        asa optimize bid-review --country AU --weak  # Focus on weak performers
-        asa optimize bid-review --days 14 --min-impressions 100
-        asa optimize bid-review --output keywords.csv
-        asa optimize bid-review --weak --interactive  # Interactively increase weak bids
-    """
+    """Review keyword bids and their performance."""
     client = get_client()
 
     end_date = date.today() - timedelta(days=1)
@@ -1078,13 +972,12 @@ def review_keyword_bids(
 
     try:
         with client:
-            # Get enabled campaigns
             with spinner("Loading campaigns..."):
-                campaigns = list(client.campaigns.find(Selector().where("status", "==", "ENABLED")))
+                campaigns = list(client.campaigns.iter_all(Query().where("status", "EQUALS", "ENABLED")))
 
             if country:
-                country = country.upper()
-                campaigns = [c for c in campaigns if country in [cc.upper() for cc in c.countries_or_regions]]
+                country_upper = country.upper()
+                campaigns = [c for c in campaigns if country_upper in [cc.upper() for cc in campaign_countries(c)]]
 
             if not campaigns:
                 print_warning("No enabled campaigns found" + (f" for {country}" if country else ""))
@@ -1092,58 +985,80 @@ def review_keyword_bids(
 
             print_info(f"Analyzing {len(campaigns)} campaigns...")
 
-            # Collect keyword performance data
             keyword_analyses: list[KeywordBidAnalysis] = []
 
             for campaign in campaigns:
-                campaign_country = campaign.countries_or_regions[0] if campaign.countries_or_regions else "?"
+                if campaign.id is None:
+                    continue
+                ctries = campaign_countries(campaign)
+                campaign_country = ctries[0] if ctries else "?"
+                camp_name = campaign.name or str(campaign.id)
 
-                with spinner(f"Fetching keyword data for {campaign.name[:30]}..."):
+                with spinner(f"Fetching keyword data for {camp_name[:30]}..."):
                     try:
-                        # Get keyword report
-                        report = client.reports.keywords(
-                            campaign_id=campaign.id,
-                            start_date=start_date,
-                            end_date=end_date,
-                            granularity=GranularityType.DAILY,
+                        req = AppsReportingRequest(
+                            filters=[
+                                ReportFilter(
+                                    field="campaignId",
+                                    operator=ReportFilterOperator.EQUALS,
+                                    value=str(campaign.id),
+                                )
+                            ],
+                            time_range=ReportTimeRange(
+                                start=start_date,
+                                end=end_date,
+                                time_zone=ReportTimeZone.UTC,
+                                granularity=ReportGranularity.DAILY,
+                            ),
                         )
-
-                        for row in report.row:
-                            if not row.metadata.keyword or not row.total:
+                        for row in client.reports.iter_keywords(req):
+                            meta = row.metadata
+                            total = row.total_metrics
+                            if not meta or not meta.text or not total or not meta.ad_group_id:
                                 continue
-                            # Skip if no ad_group_id (needed for updates)
-                            if not row.metadata.ad_group_id:
+                            if meta.deleted or (meta.ad_group and meta.ad_group.deleted):
                                 continue
-                            # Skip paused/deleted keywords and ad groups
-                            if row.metadata.keyword_status and enum_value(row.metadata.keyword_status) != "ACTIVE":
-                                continue
-                            if row.metadata.ad_group_status and enum_value(row.metadata.ad_group_status) != "ENABLED":
+                            if meta.status and enum_value(meta.status) not in ("ACTIVE", "ENABLED"):
                                 continue
 
-                            impressions = row.total.impressions or 0
-                            taps = row.total.taps or 0
-                            conversions = row.total.tap_installs or 0
-                            spend_amount = row.total.local_spend.amount if row.total.local_spend else "0"
+                            impressions = total.impressions or 0
+                            taps = total.taps or 0
+                            conversions = total.tap_installs or 0
+                            spend_amount = (
+                                total.local_spend.amount
+                                if total.local_spend and total.local_spend.amount is not None
+                                else "0"
+                            )
                             spend = Decimal(str(spend_amount))
-                            currency = row.total.local_spend.currency if row.total.local_spend else "USD"
+                            currency = (
+                                total.local_spend.currency
+                                if total.local_spend and total.local_spend.currency
+                                else campaign_currency(campaign)
+                            )
 
-                            # Calculate metrics
                             avg_cpt = spend / taps if taps > 0 else None
                             ttr = taps / impressions if impressions > 0 else None
                             cr = conversions / taps if taps > 0 else None
 
-                            # Get current bid from metadata
-                            bid_amount = row.metadata.bid_amount.amount if row.metadata.bid_amount else "0"
+                            bid_amount = meta.bid.amount if meta.bid and meta.bid.amount is not None else "0"
                             bid = Decimal(str(bid_amount))
+
+                            suggested_bid: Decimal | None = None
+                            if (
+                                row.insights
+                                and row.insights.bid_recommendation
+                                and row.insights.bid_recommendation.suggested_bid_amount is not None
+                            ):
+                                suggested_bid = Decimal(str(row.insights.bid_recommendation.suggested_bid_amount))
 
                             keyword_analyses.append(
                                 KeywordBidAnalysis(
                                     campaign_id=campaign.id,
-                                    campaign_name=campaign.name,
-                                    ad_group_id=row.metadata.ad_group_id or 0,
-                                    ad_group_name=row.metadata.ad_group_name or "",
-                                    keyword_id=row.metadata.keyword_id or 0,
-                                    keyword_text=row.metadata.keyword,
+                                    campaign_name=camp_name,
+                                    ad_group_id=meta.ad_group_id,
+                                    ad_group_name=meta.ad_group.name if meta.ad_group and meta.ad_group.name else "",
+                                    keyword_id=meta.id or 0,
+                                    keyword_text=meta.text,
                                     current_bid=bid,
                                     currency=currency,
                                     impressions=impressions,
@@ -1154,9 +1069,9 @@ def review_keyword_bids(
                                     ttr=ttr,
                                     cr=cr,
                                     country=campaign_country,
+                                    suggested_bid=suggested_bid,
                                 )
                             )
-
                     except AppleSearchAdsError:
                         continue
 
@@ -1164,8 +1079,6 @@ def review_keyword_bids(
                 print_warning("No keyword data found")
                 return
 
-            # Apply filters
-            # Filter out keywords with no data (UNKNOWN strength)
             keyword_analyses = [k for k in keyword_analyses if k.bid_strength != "UNKNOWN"]
 
             if min_impressions > 0:
@@ -1178,14 +1091,10 @@ def review_keyword_bids(
                 print_warning("No keywords match the specified filters")
                 return
 
-            # Sort by impressions (most first)
             keyword_analyses.sort(key=lambda k: k.impressions, reverse=True)
 
-            # Export to CSV if requested
             if output:
                 try:
-                    import csv
-
                     with open(output, "w", newline="") as f:
                         writer = csv.writer(f)
                         writer.writerow(
@@ -1231,7 +1140,6 @@ def review_keyword_bids(
                 except Exception as e:
                     print_error("Export failed", str(e))
 
-            # Display table
             display_count = min(limit, len(keyword_analyses))
 
             table = Table(title=f"Keyword Bid Review ({days} days)")
@@ -1244,17 +1152,12 @@ def review_keyword_bids(
             table.add_column("Strength", justify="center", width=10)
 
             for k in keyword_analyses[:display_count]:
-                # Color code strength
                 strength = k.bid_strength
-                if strength == "STRONG":
-                    strength_display = "[green]STRONG[/green]"
-                elif strength == "MODERATE":
-                    strength_display = "[yellow]MODERATE[/yellow]"
-                elif strength == "WEAK":
-                    strength_display = "[red]WEAK[/red]"
-                else:
-                    strength_display = "[dim]?[/dim]"
-
+                strength_display = {
+                    "STRONG": "[green]STRONG[/green]",
+                    "MODERATE": "[yellow]MODERATE[/yellow]",
+                    "WEAK": "[red]WEAK[/red]",
+                }.get(strength, "[dim]?[/dim]")
                 ttr_display = f"{k.ttr * 100:.1f}%" if k.ttr else "—"
 
                 table.add_row(
@@ -1272,7 +1175,6 @@ def review_keyword_bids(
             if len(keyword_analyses) > display_count:
                 print_info(f"Showing {display_count} of {len(keyword_analyses)} keywords. Use --limit to see more.")
 
-            # Summary
             strong = sum(1 for k in keyword_analyses if k.bid_strength == "STRONG")
             moderate = sum(1 for k in keyword_analyses if k.bid_strength == "MODERATE")
             weak = sum(1 for k in keyword_analyses if k.bid_strength == "WEAK")
@@ -1287,11 +1189,8 @@ def review_keyword_bids(
                     f"\n[yellow]💡 {weak} keywords have weak bid strength - consider increasing bids[/yellow]"
                 )
 
-            # Interactive mode for bid adjustments
             if interactive:
-                # Filter to weak/moderate keywords for interactive adjustment
                 adjustable = [k for k in keyword_analyses if k.bid_strength in ("WEAK", "MODERATE")]
-
                 if not adjustable:
                     print_info("No weak or moderate keywords to adjust")
                     return
@@ -1307,14 +1206,12 @@ def review_keyword_bids(
 
                 changes_made = 0
                 for i, kw in enumerate(adjustable, 1):
-                    # Skip if missing required IDs
-                    if not kw.ad_group_id or kw.ad_group_id == 0:
+                    if not kw.ad_group_id:
                         continue
 
                     console.rule(f"[bold]{i}/{len(adjustable)}")
                     console.print()
 
-                    # Show keyword details
                     strength_color = "red" if kw.bid_strength == "WEAK" else "yellow"
                     console.print(f"[bold]Keyword:[/bold] {kw.keyword_text} [dim]ID: {kw.keyword_id}[/dim]")
                     console.print(
@@ -1333,8 +1230,9 @@ def review_keyword_bids(
                         console.print(f"  Avg CPT:         {kw.avg_cpt:.2f} {kw.currency}")
                     console.print()
 
-                    # Suggest a new bid (20% increase for weak, 10% for moderate)
-                    if kw.bid_strength == "WEAK":
+                    if kw.suggested_bid is not None:
+                        suggested = round(kw.suggested_bid, 2)
+                    elif kw.bid_strength == "WEAK":
                         suggested = round(kw.current_bid * Decimal("1.20"), 2)
                     else:
                         suggested = round(kw.current_bid * Decimal("1.10"), 2)
@@ -1342,28 +1240,18 @@ def review_keyword_bids(
                     console.print(f"[bold]Suggested:[/bold] {suggested:.2f} {kw.currency}")
                     console.print()
 
-                    action = (
-                        typer.prompt(
-                            "New bid",
-                            default=str(suggested),
-                            show_default=True,
-                        )
-                        .strip()
-                        .lower()
-                    )
+                    action = typer.prompt("New bid", default=str(suggested), show_default=True).strip().lower()
 
                     if action in ("q", "quit"):
                         print_info("Quitting...")
                         break
-                    elif action in ("s", "skip", ""):
+                    if action in ("s", "skip", ""):
                         console.print("[dim]Skipped[/dim]")
                         console.print()
                         continue
 
-                    # Parse the new bid
                     try:
                         if action.startswith("+"):
-                            # Relative increase
                             if action.endswith("%"):
                                 pct = Decimal(action[1:-1]) / 100
                                 new_bid = round(kw.current_bid * (1 + pct), 2)
@@ -1375,72 +1263,50 @@ def review_keyword_bids(
                         if new_bid <= 0:
                             print_warning("Invalid bid (must be positive), skipping")
                             continue
-
                     except Exception:
                         print_warning(f"Invalid input '{action}', skipping")
                         continue
 
-                    # Apply the change
-                    # Fetch keywords from ad group to find matching keyword by text
-                    try:
-                        with spinner("Fetching keywords from ad group..."):
-                            keywords = list(
-                                client.campaigns(kw.campaign_id).ad_groups(kw.ad_group_id).keywords.list(limit=200)
+                    target_keyword_id = kw.keyword_id
+                    if not target_keyword_id:
+                        try:
+                            with spinner("Fetching keywords from ad group..."):
+                                keywords = list(
+                                    client.keywords.iter_all(Query().where("adGroupId", "EQUALS", kw.ad_group_id))
+                                )
+                            actual_keyword = next(
+                                (
+                                    k
+                                    for k in keywords
+                                    if k.text
+                                    and k.text.lower() == kw.keyword_text.lower()
+                                    and enum_value(k.status) in ("ENABLED", "ACTIVE")
+                                    and k.id is not None
+                                ),
+                                None,
                             )
-                    except AppleSearchAdsError as e:
-                        print_error(
-                            "Failed to fetch keywords",
-                            f"{e.message} (campaign={kw.campaign_id}, adgroup={kw.ad_group_id})",
-                        )
-                        continue
-
-                    # Find matching ACTIVE keyword by text
-                    actual_keyword = next(
-                        (
-                            k
-                            for k in keywords
-                            if k.text.lower() == kw.keyword_text.lower() and enum_value(k.status) == "ACTIVE"
-                        ),
-                        None,
-                    )
-                    if not actual_keyword:
-                        active_keywords = [k.text for k in keywords if enum_value(k.status) == "ACTIVE"]
-                        sample = active_keywords[:10]
-                        ellipsis = "..." if len(active_keywords) > 10 else ""
-                        print_warning(
-                            f"Keyword '{kw.keyword_text}' not found in ad group "
-                            f"(found {len(active_keywords)} active keywords: {sample}{ellipsis})"
-                        )
-                        continue
+                            if not actual_keyword or actual_keyword.id is None:
+                                print_warning(f"Keyword '{kw.keyword_text}' not found in ad group")
+                                continue
+                            target_keyword_id = actual_keyword.id
+                        except AppleSearchAdsError as e:
+                            print_error("Failed to fetch keywords", e.message)
+                            continue
 
                     try:
-                        with spinner(f"Updating keyword {actual_keyword.id}..."):
-                            # Must use bulk endpoint - Apple API doesn't support single keyword PUT
-                            client.campaigns(kw.campaign_id).ad_groups(kw.ad_group_id).keywords.update_bulk(
-                                [
-                                    (
-                                        actual_keyword.id,
-                                        KeywordUpdate(
-                                            bid_amount=Money(
-                                                amount=str(new_bid),
-                                                currency=kw.currency,
-                                            )
-                                        ),
-                                    )
-                                ]
+                        with spinner(f"Updating keyword {target_keyword_id}..."):
+                            client.keywords.update(
+                                target_keyword_id,
+                                KeywordUpdate(bid=Money(amount=str(new_bid), currency=kw.currency)),
                             )
                     except AppleSearchAdsError as e:
-                        print_error("Update failed", f"{e.message} (keyword_id={actual_keyword.id})")
-                        continue
-                    except Exception as e:
-                        print_error("Update failed", str(e))
+                        print_error("Update failed", f"{e.message} (keyword_id={target_keyword_id})")
                         continue
 
                     print_success(f"Updated: {kw.current_bid:.2f} → {new_bid:.2f} {kw.currency}")
                     changes_made += 1
                     console.print()
 
-                # Summary
                 console.print()
                 if changes_made > 0:
                     print_result_panel(
@@ -1460,7 +1326,7 @@ def review_keyword_bids(
 
 @dataclass
 class CpaCapAnalysis:
-    """Analysis of CPA cap impact on ad group delivery."""
+    """Analysis of Target CPA impact on MAX_CONVERSIONS ad group delivery."""
 
     campaign_id: int
     campaign_name: str
@@ -1476,55 +1342,51 @@ class CpaCapAnalysis:
     installs_30d: int
     spend_30d: Decimal
     country: str
+    scope: Literal["ad_group", "campaign"] = "ad_group"
+    recommended_target_cpa: Decimal | None = None
+    recommendation_id: str | None = None
+    promoted_object_id: str | None = None
+    promoted_object_type: str | None = None
 
     @property
     def cpa_utilization(self) -> float | None:
-        """Percentage of CPA goal utilized (avg_cpa / cpa_goal * 100)."""
+        """Percentage of Target CPA utilized (avg_cpa / cpa_goal * 100)."""
         if self.avg_cpa is None or self.cpa_goal == 0:
             return None
         return float(self.avg_cpa / self.cpa_goal * 100)
 
     @property
     def impact_level(self) -> str:
-        """Estimate impact level of CPA cap on delivery.
-
-        - BLOCKED: No impressions at all - CPA goal likely blocking delivery
-        - CRITICAL: CPA >= 95% of goal - likely severely limited
-        - HIGH: CPA 85-95% of goal - probably limited
-        - MODERATE: CPA 70-85% of goal - may be slightly limited
-        - LOW: CPA < 70% of goal - unlikely to be limited
-        """
-        # If no impressions in 30 days, CPA goal is likely blocking delivery
+        """Estimate impact level of Target CPA on delivery."""
         if self.impressions_30d == 0:
             return "BLOCKED"
-
         util = self.cpa_utilization
         if util is None:
             return "UNKNOWN"
-
         if util >= 95:
             return "CRITICAL"
-        elif util >= 85:
+        if util >= 85:
             return "HIGH"
-        elif util >= 70:
+        if util >= 70:
             return "MODERATE"
-        else:
-            return "LOW"
+        return "LOW"
 
     @property
     def recommendation(self) -> str:
-        """Suggest action based on CPA cap impact."""
+        """Suggest action based on Target CPA impact."""
+        if self.recommended_target_cpa is not None:
+            return f"Apple recommends Target CPA {self.recommended_target_cpa:.2f} {self.currency}"
         level = self.impact_level
         if level == "BLOCKED":
-            return "Remove CPA goal - blocking all delivery"
-        elif level == "CRITICAL":
-            return "Increase CPA goal or reduce bids"
-        elif level == "HIGH":
-            return "Consider increasing CPA goal"
-        elif level == "MODERATE":
+            return "Remove or raise Target CPA - blocking delivery"
+        if level == "CRITICAL":
+            return "Increase Target CPA"
+        if level == "HIGH":
+            return "Consider increasing Target CPA"
+        if level == "MODERATE":
             return "Monitor - may become limited"
-        elif level == "LOW":
-            return "CPA cap not limiting delivery"
+        if level == "LOW":
+            return "Target CPA not limiting delivery"
         return "Need more conversion data"
 
 
@@ -1540,36 +1402,21 @@ def analyze_cpa_cap_impact(
     ] = 0,
     critical_only: Annotated[
         bool,
-        typer.Option("--critical", help="Only show ad groups with critical/high/blocked CPA impact"),
+        typer.Option("--critical", help="Only show ad groups with critical/high/blocked Target CPA impact"),
     ] = False,
     interactive: Annotated[
         bool,
-        typer.Option("--interactive", "-i", help="Interactive mode to remove CPA goals"),
+        typer.Option("--interactive", "-i", help="Interactive mode to adjust or remove Target CPA"),
     ] = False,
     output: Annotated[
         str | None,
         typer.Option("--output", "-o", help="Export to CSV file"),
     ] = None,
 ) -> None:
-    """Analyze whether CPA caps are limiting ad group delivery.
+    """Analyze Target CPA impact on Maximize Conversions (MAX_CONVERSIONS) ad groups.
 
-    Compares each ad group's actual average CPA against its CPA goal to identify
-    where CPA caps may be causing reduced delivery. Shows both 7-day and 30-day
-    impression data to help identify delivery issues.
-
-    Impact levels:
-    - BLOCKED: No impressions - CPA goal is completely blocking delivery
-    - CRITICAL (≥95% of goal): Likely severely limited by CPA cap
-    - HIGH (85-95%): Probably experiencing delivery limitations
-    - MODERATE (70-85%): May be slightly limited during peak times
-    - LOW (<70%): CPA cap unlikely to be limiting delivery
-
-    Examples:
-        asa optimize cpa-impact                    # Analyze all ad groups
-        asa optimize cpa-impact --country US       # Filter to US campaigns
-        asa optimize cpa-impact --critical         # Only show problem ad groups
-        asa optimize cpa-impact --interactive      # Interactively remove CPA goals
-        asa optimize cpa-impact -o cpa-analysis.csv
+    In Platform API v1, Target CPA lives on MAX_CONVERSIONS ad groups/campaigns
+    and Apple surfaces Target CPA recommendations via /v1/recommendations/target-cpas.
     """
     client = get_client()
 
@@ -1579,40 +1426,97 @@ def analyze_cpa_cap_impact(
 
     try:
         with client:
-            # Get enabled campaigns
             with spinner("Loading campaigns..."):
-                campaigns = list(client.campaigns.find(Selector().where("status", "==", "ENABLED")))
+                campaigns = list(client.campaigns.iter_all(Query().where("status", "EQUALS", "ENABLED")))
 
             if country:
-                country = country.upper()
-                campaigns = [c for c in campaigns if country in [cc.upper() for cc in c.countries_or_regions]]
+                country_upper = country.upper()
+                campaigns = [c for c in campaigns if country_upper in [cc.upper() for cc in campaign_countries(c)]]
 
             if not campaigns:
                 print_warning("No enabled campaigns found" + (f" for {country}" if country else ""))
                 return
 
-            print_info(f"Analyzing {len(campaigns)} campaigns for CPA cap impact...")
+            print_info(f"Analyzing {len(campaigns)} campaigns for Target CPA impact...")
 
-            # Collect ad groups with CPA goals and their performance
+            # Fetch AVAILABLE Target CPA recommendations per promoted object
+            tcpa_recs_by_campaign: dict[int, TargetCpaRecommendation] = {}
+            promoted_objects: set[tuple[str, str]] = set()
+            for camp in campaigns:
+                if camp.promoted_object_id and camp.promoted_object_type:
+                    promoted_objects.add((camp.promoted_object_id, enum_value(camp.promoted_object_type)))
+
+            for pid, ptype in promoted_objects:
+                try:
+                    rec_query = RecommendationQueryRequest.for_promoted_object(
+                        pid,
+                        ptype,
+                        filters=[
+                            RecommendationFilterCondition(
+                                field="state",
+                                operator=RecommendationFilterOperator.EQUALS,
+                                value=[RecommendationState.AVAILABLE.value],
+                            )
+                        ],
+                    )
+                    for rec in client.recommendations.iter_target_cpas(rec_query):
+                        if rec.campaign_id is not None:
+                            tcpa_recs_by_campaign[rec.campaign_id] = rec
+                except AppleSearchAdsError:
+                    continue
+
             cpa_analyses: list[CpaCapAnalysis] = []
             ad_groups_with_goals = 0
             ad_groups_without_goals = 0
 
             for campaign in campaigns:
-                campaign_country = campaign.countries_or_regions[0] if campaign.countries_or_regions else "?"
+                if campaign.id is None:
+                    continue
+                ctries = campaign_countries(campaign)
+                campaign_country = ctries[0] if ctries else "?"
+                camp_name = campaign.name or str(campaign.id)
 
-                with spinner(f"Analyzing {campaign.name[:40]}..."):
+                camp_tcpa: Money | None = None
+                if (
+                    campaign.bid_strategy
+                    and enum_value(campaign.bid_strategy.bid_strategy_type) == BidStrategyType.MAX_CONVERSIONS.value
+                    and campaign.bid_strategy.bid
+                    and campaign.bid_strategy.bid.amount is not None
+                    and Decimal(campaign.bid_strategy.bid.amount) > 0
+                ):
+                    camp_tcpa = campaign.bid_strategy.bid
+
+                with spinner(f"Analyzing {camp_name[:40]}..."):
                     try:
-                        # Get ad groups for this campaign
                         ad_groups = list(
-                            client.campaigns(campaign.id).ad_groups.find(Selector().where("status", "==", "ENABLED"))
+                            client.ad_groups.iter_all(
+                                Query().where("campaignId", "EQUALS", campaign.id).where("status", "EQUALS", "ENABLED")
+                            )
                         )
 
-                        # Filter to ad groups with CPA goals
-                        ad_groups_with_cpa = []
+                        ad_groups_with_cpa: list[tuple[Any, Decimal, str, Literal["ad_group", "campaign"]]] = []
                         for ag in ad_groups:
-                            if ag.cpa_goal and ag.cpa_goal.amount:
-                                ad_groups_with_cpa.append(ag)
+                            ag_tcpa: Money | None = None
+                            scope: Literal["ad_group", "campaign"] = "ad_group"
+                            if (
+                                ag.bid_strategy
+                                and enum_value(ag.bid_strategy.bid_strategy_type)
+                                == BidStrategyType.MAX_CONVERSIONS.value
+                            ):
+                                ag_tcpa = ad_group_bid_money(ag)
+                            elif ag.bid_strategy is None and camp_tcpa is not None:
+                                ag_tcpa = camp_tcpa
+                                scope = "campaign"
+
+                            if ag_tcpa and ag_tcpa.amount is not None and Decimal(ag_tcpa.amount) > 0:
+                                ad_groups_with_cpa.append(
+                                    (
+                                        ag,
+                                        Decimal(ag_tcpa.amount),
+                                        ag_tcpa.currency or campaign_currency(campaign),
+                                        scope,
+                                    )
+                                )
                                 ad_groups_with_goals += 1
                             else:
                                 ad_groups_without_goals += 1
@@ -1620,49 +1524,65 @@ def analyze_cpa_cap_impact(
                         if not ad_groups_with_cpa:
                             continue
 
-                        # Get 30-day ad group performance report
-                        report_30d = client.reports.ad_groups(
-                            campaign_id=campaign.id,
-                            start_date=start_date_30d,
-                            end_date=end_date,
-                            granularity=GranularityType.DAILY,
-                        )
+                        camp_id = require_id(campaign.id, "campaign")
 
-                        # Get 7-day ad group performance report
-                        report_7d = client.reports.ad_groups(
-                            campaign_id=campaign.id,
-                            start_date=start_date_7d,
-                            end_date=end_date,
-                            granularity=GranularityType.DAILY,
-                        )
-
-                        # Build maps of ad group performance for both periods
-                        def aggregate_report(report: Any) -> dict[int, dict[str, Any]]:
+                        def fetch_ag_perf(
+                            start_d: date,
+                            cid: int = camp_id,
+                            default_curr: str = campaign_currency(campaign),
+                        ) -> dict[int, dict[str, Any]]:
                             perf: dict[int, dict[str, Any]] = {}
-                            for row in report.row:
-                                if row.metadata.ad_group_id and row.total:
-                                    ag_id = row.metadata.ad_group_id
+                            req = AppsReportingRequest(
+                                filters=[
+                                    ReportFilter(
+                                        field="campaignId",
+                                        operator=ReportFilterOperator.EQUALS,
+                                        value=str(cid),
+                                    )
+                                ],
+                                time_range=ReportTimeRange(
+                                    start=start_d,
+                                    end=end_date,
+                                    time_zone=ReportTimeZone.UTC,
+                                    granularity=ReportGranularity.DAILY,
+                                ),
+                            )
+                            for row in client.reports.iter_ad_groups(req):
+                                if row.metadata and row.metadata.id is not None and row.total_metrics:
+                                    ag_id = row.metadata.id
+                                    tm = row.total_metrics
                                     if ag_id not in perf:
                                         perf[ag_id] = {
                                             "impressions": 0,
                                             "taps": 0,
                                             "installs": 0,
                                             "spend": Decimal("0"),
-                                            "currency": "USD",
+                                            "currency": default_curr,
                                         }
-                                    perf[ag_id]["impressions"] += row.total.impressions or 0
-                                    perf[ag_id]["taps"] += row.total.taps or 0
-                                    perf[ag_id]["installs"] += row.total.tap_installs or 0
-                                    if row.total.local_spend:
-                                        perf[ag_id]["spend"] += Decimal(str(row.total.local_spend.amount))
-                                        perf[ag_id]["currency"] = row.total.local_spend.currency
+                                    perf[ag_id]["impressions"] += tm.impressions or 0
+                                    perf[ag_id]["taps"] += tm.taps or 0
+                                    perf[ag_id]["installs"] += tm.tap_installs or 0
+                                    if tm.local_spend and tm.local_spend.amount is not None:
+                                        perf[ag_id]["spend"] += Decimal(str(tm.local_spend.amount))
+                                        if tm.local_spend.currency:
+                                            perf[ag_id]["currency"] = tm.local_spend.currency
                             return perf
 
-                        ag_perf_30d = aggregate_report(report_30d)
-                        ag_perf_7d = aggregate_report(report_7d)
+                        ag_perf_30d = fetch_ag_perf(start_date_30d)
+                        ag_perf_7d = fetch_ag_perf(start_date_7d)
 
-                        # Analyze each ad group with a CPA goal
-                        for ag in ad_groups_with_cpa:
+                        camp_rec = tcpa_recs_by_campaign.get(campaign.id)
+                        rec_tcpa_dec = (
+                            Decimal(camp_rec.recommended_target_cpa.amount)
+                            if camp_rec
+                            and camp_rec.recommended_target_cpa
+                            and camp_rec.recommended_target_cpa.amount is not None
+                            else None
+                        )
+
+                        for ag, cpa_goal, goal_currency, scope in ad_groups_with_cpa:
+                            if ag.id is None:
+                                continue
                             perf_30d = ag_perf_30d.get(ag.id, {})
                             perf_7d = ag_perf_7d.get(ag.id, {})
 
@@ -1672,30 +1592,16 @@ def analyze_cpa_cap_impact(
                             taps_7d = perf_7d.get("taps", 0)
                             installs_30d = perf_30d.get("installs", 0)
                             spend_30d = perf_30d.get("spend", Decimal("0"))
-                            currency = perf_30d.get("currency", "USD")
+                            currency = perf_30d.get("currency", goal_currency)
 
-                            # Parse CPA goal
-                            if ag.cpa_goal is None:
-                                continue
-                            cpa_goal_amount = ag.cpa_goal.amount
-                            if hasattr(cpa_goal_amount, "amount"):
-                                # Money object
-                                cpa_goal = Decimal(str(cpa_goal_amount.amount))
-                            else:
-                                # Direct string/number
-                                cpa_goal = Decimal(str(cpa_goal_amount))
-
-                            # Calculate actual CPA
-                            avg_cpa = None
-                            if installs_30d > 0 and spend_30d > 0:
-                                avg_cpa = spend_30d / installs_30d
+                            avg_cpa = (spend_30d / installs_30d) if installs_30d > 0 and spend_30d > 0 else None
 
                             cpa_analyses.append(
                                 CpaCapAnalysis(
                                     campaign_id=campaign.id,
-                                    campaign_name=campaign.name,
+                                    campaign_name=camp_name,
                                     ad_group_id=ag.id,
-                                    ad_group_name=ag.name,
+                                    ad_group_name=ag.name or str(ag.id),
                                     cpa_goal=cpa_goal,
                                     avg_cpa=avg_cpa,
                                     currency=currency,
@@ -1706,41 +1612,41 @@ def analyze_cpa_cap_impact(
                                     installs_30d=installs_30d,
                                     spend_30d=spend_30d,
                                     country=campaign_country,
+                                    scope=scope,
+                                    recommended_target_cpa=rec_tcpa_dec,
+                                    recommendation_id=camp_rec.id if camp_rec else None,
+                                    promoted_object_id=campaign.promoted_object_id,
+                                    promoted_object_type=enum_value(campaign.promoted_object_type),
                                 )
                             )
-
                     except AppleSearchAdsError:
                         continue
 
             if not cpa_analyses:
-                print_warning("No ad groups with CPA goals found")
-                console.print(f"\n[dim]Ad groups scanned: {ad_groups_without_goals} (none had CPA goals set)[/dim]")
+                print_warning("No MAX_CONVERSIONS ad groups with Target CPA found")
+                console.print(
+                    f"\n[dim]Ad groups scanned: {ad_groups_without_goals} "
+                    "(none had MAX_CONVERSIONS Target CPA set)[/dim]"
+                )
                 return
 
-            # Filter by minimum installs
             if min_installs > 0:
                 cpa_analyses = [a for a in cpa_analyses if a.installs_30d >= min_installs]
-
                 if not cpa_analyses:
-                    print_warning(f"No ad groups with CPA goals have at least {min_installs} installs")
+                    print_warning(f"No ad groups with Target CPA have at least {min_installs} installs")
                     return
 
-            # Filter to critical/high/blocked only if requested
             if critical_only:
                 cpa_analyses = [a for a in cpa_analyses if a.impact_level in ("BLOCKED", "CRITICAL", "HIGH")]
                 if not cpa_analyses:
-                    print_success("No ad groups with critical, high, or blocked CPA cap impact")
+                    print_success("No ad groups with critical, high, or blocked Target CPA impact")
                     return
 
-            # Sort by impact level (BLOCKED first, then by CPA utilization)
             impact_order = {"BLOCKED": 0, "CRITICAL": 1, "HIGH": 2, "UNKNOWN": 3, "MODERATE": 4, "LOW": 5}
             cpa_analyses.sort(key=lambda a: (impact_order.get(a.impact_level, 99), -(a.cpa_utilization or 0)))
 
-            # Export to CSV if requested
             if output:
                 try:
-                    import csv
-
                     with open(output, "w", newline="") as f:
                         writer = csv.writer(f)
                         writer.writerow(
@@ -1748,7 +1654,8 @@ def analyze_cpa_cap_impact(
                                 "campaign_name",
                                 "ad_group_name",
                                 "country",
-                                "cpa_goal",
+                                "target_cpa",
+                                "recommended_target_cpa",
                                 "avg_cpa",
                                 "cpa_utilization_pct",
                                 "impact_level",
@@ -1769,6 +1676,7 @@ def analyze_cpa_cap_impact(
                                     a.ad_group_name,
                                     a.country,
                                     f"{a.cpa_goal:.2f}",
+                                    f"{a.recommended_target_cpa:.2f}" if a.recommended_target_cpa else "",
                                     f"{a.avg_cpa:.2f}" if a.avg_cpa else "",
                                     f"{a.cpa_utilization:.1f}" if a.cpa_utilization else "",
                                     a.impact_level,
@@ -1786,37 +1694,28 @@ def analyze_cpa_cap_impact(
                 except Exception as e:
                     print_error("Export failed", str(e))
 
-            # Display results table
             console.print()
-            table = Table(title="CPA Cap Impact Analysis")
+            table = Table(title="Target CPA Impact Analysis (MAX_CONVERSIONS)")
             table.add_column("Ad Group", style="cyan", max_width=22)
             table.add_column("Campaign", style="magenta", max_width=18)
-            table.add_column("CPA Goal", justify="right", width=8)
+            table.add_column("Target CPA", justify="right", width=10)
             table.add_column("Avg CPA", justify="right", width=8)
             table.add_column("Impr 7d", justify="right", width=8)
             table.add_column("Impr 30d", justify="right", width=9)
             table.add_column("Taps 30d", justify="right", width=8)
             table.add_column("Impact", justify="center", width=10)
 
-            for a in cpa_analyses[:50]:  # Limit display
-                # Color code impact level
+            for a in cpa_analyses[:50]:
                 impact = a.impact_level
-                if impact == "BLOCKED":
-                    impact_display = "[red bold]BLOCKED[/red bold]"
-                elif impact == "CRITICAL":
-                    impact_display = "[red bold]CRITICAL[/red bold]"
-                elif impact == "HIGH":
-                    impact_display = "[red]HIGH[/red]"
-                elif impact == "MODERATE":
-                    impact_display = "[yellow]MODERATE[/yellow]"
-                elif impact == "LOW":
-                    impact_display = "[green]LOW[/green]"
-                else:
-                    impact_display = "[dim]?[/dim]"
+                impact_display = {
+                    "BLOCKED": "[red bold]BLOCKED[/red bold]",
+                    "CRITICAL": "[red bold]CRITICAL[/red bold]",
+                    "HIGH": "[red]HIGH[/red]",
+                    "MODERATE": "[yellow]MODERATE[/yellow]",
+                    "LOW": "[green]LOW[/green]",
+                }.get(impact, "[dim]?[/dim]")
 
                 avg_cpa_display = f"{a.avg_cpa:.2f}" if a.avg_cpa else "—"
-
-                # Color code impressions (red if zero)
                 impr_7d = "[red]0[/red]" if a.impressions_7d == 0 else f"{a.impressions_7d:,}"
                 impr_30d = "[red]0[/red]" if a.impressions_30d == 0 else f"{a.impressions_30d:,}"
 
@@ -1836,7 +1735,6 @@ def analyze_cpa_cap_impact(
             if len(cpa_analyses) > 50:
                 print_info(f"Showing 50 of {len(cpa_analyses)} ad groups. Use --output to export all.")
 
-            # Summary
             blocked = sum(1 for a in cpa_analyses if a.impact_level == "BLOCKED")
             critical = sum(1 for a in cpa_analyses if a.impact_level == "CRITICAL")
             high = sum(1 for a in cpa_analyses if a.impact_level == "HIGH")
@@ -1845,7 +1743,7 @@ def analyze_cpa_cap_impact(
             unknown = sum(1 for a in cpa_analyses if a.impact_level == "UNKNOWN")
 
             console.print()
-            console.print("[bold]CPA Cap Impact Summary:[/bold]")
+            console.print("[bold]Target CPA Impact Summary:[/bold]")
             if blocked > 0:
                 console.print(f"  [red bold]Blocked (0 impressions):[/red bold] {blocked}")
             console.print(f"  [red bold]Critical:[/red bold] {critical}")
@@ -1856,32 +1754,22 @@ def analyze_cpa_cap_impact(
                 console.print(f"  [dim]Unknown (no conversions):[/dim] {unknown}")
 
             console.print()
-            console.print(f"[dim]Ad groups with CPA goals: {ad_groups_with_goals}[/dim]")
-            console.print(f"[dim]Ad groups without CPA goals: {ad_groups_without_goals}[/dim]")
+            console.print(f"[dim]Ad groups with Target CPA: {ad_groups_with_goals}[/dim]")
+            console.print(f"[dim]Ad groups without Target CPA: {ad_groups_without_goals}[/dim]")
 
-            if blocked + critical + high > 0:
-                console.print()
-                print_warning(f"{blocked + critical + high} ad groups are likely being limited by their CPA caps.")
-                if blocked > 0:
-                    console.print(
-                        f"[yellow]  {blocked} ad groups have 0 impressions - consider removing CPA goals[/yellow]"
-                    )
-
-            # Interactive mode to remove CPA goals
             if interactive:
-                # Filter to blocked/critical/high ad groups for interactive removal
                 problem_groups = [a for a in cpa_analyses if a.impact_level in ("BLOCKED", "CRITICAL", "HIGH")]
-
                 if not problem_groups:
                     print_info("No problem ad groups to process")
                     return
 
                 console.print()
-                console.rule("[bold]Interactive CPA Goal Management")
+                console.rule("[bold]Interactive Target CPA Management")
                 console.print()
                 console.print("[dim]For each ad group, choose an action:[/dim]")
-                console.print("[dim]  • 'r' or 'remove' - Remove CPA goal[/dim]")
-                console.print("[dim]  • 'i' or 'increase' - Increase CPA goal (enter new value)[/dim]")
+                console.print("[dim]  • 'r' or 'remove' - Clear Target CPA cap on MAX_CONVERSIONS[/dim]")
+                console.print("[dim]  • 'i' or 'increase' - Increase Target CPA (enter new value)[/dim]")
+                console.print("[dim]  • 'a' or 'apply' - Apply Apple's recommended Target CPA (if available)[/dim]")
                 console.print("[dim]  • 's' or 'skip' - Skip this ad group[/dim]")
                 console.print("[dim]  • 'q' or 'quit' - Stop processing[/dim]")
                 console.print()
@@ -1891,96 +1779,113 @@ def analyze_cpa_cap_impact(
                     console.rule(f"[bold]{i}/{len(problem_groups)}")
                     console.print()
 
-                    # Show ad group details
                     impact_color = "red" if analysis.impact_level in ("BLOCKED", "CRITICAL") else "yellow"
-                    console.print(f"[bold]Ad Group:[/bold] {analysis.ad_group_name}")
+                    console.print(f"[bold]Ad Group:[/bold] {analysis.ad_group_name} [dim]({analysis.scope})[/dim]")
                     console.print(f"[bold]Campaign:[/bold] {analysis.campaign_name} ({analysis.country})")
                     console.print()
                     cpa_str = f"{analysis.cpa_goal:.2f} {analysis.currency}"
-                    console.print(f"  CPA Goal:        [{impact_color}]{cpa_str}[/{impact_color}]")
+                    console.print(f"  Target CPA:      [{impact_color}]{cpa_str}[/{impact_color}]")
+                    if analysis.recommended_target_cpa is not None:
+                        console.print(
+                            f"  Apple Suggested: [green]{analysis.recommended_target_cpa:.2f} "
+                            f"{analysis.currency}[/green]"
+                        )
                     if analysis.avg_cpa:
                         console.print(f"  Actual Avg CPA:  {analysis.avg_cpa:.2f} {analysis.currency}")
                     console.print(f"  Impressions 7d:  {analysis.impressions_7d:,}")
                     console.print(f"  Impressions 30d: {analysis.impressions_30d:,}")
-                    console.print(f"  Taps 30d:        {analysis.taps_30d:,}")
                     console.print(f"  Installs 30d:    {analysis.installs_30d:,}")
                     console.print(f"  Impact:          [{impact_color}]{analysis.impact_level}[/{impact_color}]")
                     console.print()
 
-                    action = (
-                        typer.prompt(
-                            "Action",
-                            default="skip",
-                            show_default=True,
-                        )
-                        .strip()
-                        .lower()
-                    )
+                    action = typer.prompt("Action", default="skip", show_default=True).strip().lower()
 
                     if action in ("q", "quit"):
                         print_info("Quitting...")
                         break
-                    elif action in ("s", "skip", ""):
+                    if action in ("s", "skip", ""):
                         console.print("[dim]Skipped[/dim]")
                         console.print()
                         continue
-                    elif action in ("r", "remove"):
-                        # Remove CPA goal by setting it to None
+                    if action in ("a", "apply") and analysis.recommendation_id and analysis.promoted_object_id:
                         try:
-                            with spinner("Removing CPA goal..."):
-                                # Update ad group with cpa_goal set to remove it
-                                # Note: The API may require a specific way to clear the CPA goal
-                                client.campaigns(analysis.campaign_id).ad_groups.update(
-                                    analysis.ad_group_id,
-                                    AdGroupUpdate(cpa_goal=None),
+                            with spinner("Applying Apple Target CPA recommendation..."):
+                                ptype_enum = RecommendationPromotedObjectType(
+                                    analysis.promoted_object_type or "APPSTORE_APP"
                                 )
-                            print_success(f"Removed CPA goal from '{analysis.ad_group_name}'")
+                                client.recommendations.apply_target_cpas(
+                                    [
+                                        ApplyTargetCpaRecommendation(
+                                            id=analysis.recommendation_id,
+                                            promoted_object_id=analysis.promoted_object_id,
+                                            promoted_object_type=ptype_enum,
+                                        )
+                                    ]
+                                )
+                            print_success(f"Applied recommended Target CPA for '{analysis.campaign_name}'")
                             changes_made += 1
                         except AppleSearchAdsError as e:
-                            print_error("Failed to remove CPA goal", str(e))
+                            print_error("Failed to apply recommendation", str(e))
+                        console.print()
+                    elif action in ("r", "remove"):
+                        try:
+                            with spinner("Clearing Target CPA cap..."):
+                                if analysis.scope == "campaign":
+                                    client.campaigns.update(
+                                        analysis.campaign_id,
+                                        CampaignUpdate(bid_strategy=target_cpa_bid_strategy(None)),
+                                    )
+                                else:
+                                    client.ad_groups.update(
+                                        analysis.ad_group_id,
+                                        AdGroupUpdate(bid_strategy=target_cpa_bid_strategy(None)),
+                                    )
+                            print_success(f"Cleared Target CPA cap from '{analysis.ad_group_name}'")
+                            changes_made += 1
+                        except AppleSearchAdsError as e:
+                            print_error("Failed to clear Target CPA", str(e))
                         console.print()
                     elif action in ("i", "increase"):
-                        # Prompt for new CPA goal
-                        suggested = analysis.cpa_goal * Decimal("1.5")  # Suggest 50% increase
+                        suggested = analysis.recommended_target_cpa or (analysis.cpa_goal * Decimal("1.5"))
                         new_goal_str = typer.prompt(
-                            f"New CPA goal ({analysis.currency})",
+                            f"New Target CPA ({analysis.currency})",
                             default=f"{suggested:.2f}",
                         )
                         try:
                             new_goal = Decimal(new_goal_str)
                             if new_goal <= 0:
-                                print_warning("Invalid CPA goal, skipping")
+                                print_warning("Invalid Target CPA, skipping")
                                 continue
 
-                            with spinner("Updating CPA goal..."):
-                                from asa_api_client.models import CpaGoal as CpaGoalModel
-
-                                client.campaigns(analysis.campaign_id).ad_groups.update(
-                                    analysis.ad_group_id,
-                                    AdGroupUpdate(
-                                        cpa_goal=CpaGoalModel(
-                                            amount=Money(amount=str(new_goal), currency=analysis.currency)
-                                        )
-                                    ),
-                                )
+                            with spinner("Updating Target CPA..."):
+                                new_bs = target_cpa_bid_strategy(new_goal, analysis.currency)
+                                if analysis.scope == "campaign":
+                                    client.campaigns.update(
+                                        analysis.campaign_id,
+                                        CampaignUpdate(bid_strategy=new_bs),
+                                    )
+                                else:
+                                    client.ad_groups.update(
+                                        analysis.ad_group_id,
+                                        AdGroupUpdate(bid_strategy=new_bs),
+                                    )
                             print_success(
-                                f"Updated CPA goal: {analysis.cpa_goal:.2f} → {new_goal:.2f} {analysis.currency}"
+                                f"Updated Target CPA: {analysis.cpa_goal:.2f} → {new_goal:.2f} {analysis.currency}"
                             )
                             changes_made += 1
                         except ValueError:
                             print_warning(f"Invalid input '{new_goal_str}', skipping")
                         except AppleSearchAdsError as e:
-                            print_error("Failed to update CPA goal", str(e))
+                            print_error("Failed to update Target CPA", str(e))
                         console.print()
                     else:
                         console.print(f"[dim]Unknown action '{action}', skipping[/dim]")
                         console.print()
 
-                # Summary
                 console.print()
                 if changes_made > 0:
                     print_result_panel(
-                        "CPA Goal Management Complete",
+                        "Target CPA Management Complete",
                         {
                             "Ad groups reviewed": str(len(problem_groups)),
                             "Changes made": str(changes_made),
@@ -2166,14 +2071,7 @@ def negatives(
         typer.Option("--output", "-o", help="Export suggestions to CSV file"),
     ] = None,
 ) -> None:
-    """Analyse search terms with AI and suggest negative keywords.
-
-    Pulls search term reports across all campaigns (or a single campaign),
-    sends performance data to an AI model for relevance classification,
-    and optionally applies the suggestions as campaign-level negative keywords.
-
-    Requires ANTHROPIC_API_KEY or GEMINI_API_KEY in environment or .env file.
-    """
+    """Analyse search terms with AI and suggest negative keywords."""
     import asyncio
 
     from asa_api_cli.translate import get_translate_settings
@@ -2191,18 +2089,19 @@ def negatives(
 
     try:
         with client:
-            # Collect campaigns to analyse
             if campaign_id:
                 with spinner("Fetching campaign..."):
                     campaign = client.campaigns.get(campaign_id)
                 target_campaigns = [campaign]
             else:
                 with spinner("Loading campaigns..."):
-                    target_campaigns = list(client.campaigns.find(Selector().where("status", "==", "ENABLED")))
+                    target_campaigns = list(client.campaigns.iter_all(Query().where("status", "EQUALS", "ENABLED")))
 
             if country:
-                country = country.upper()
-                target_campaigns = [c for c in target_campaigns if country in (c.countries_or_regions or [])]
+                country_upper = country.upper()
+                target_campaigns = [
+                    c for c in target_campaigns if country_upper in [cc.upper() for cc in campaign_countries(c)]
+                ]
 
             if not target_campaigns:
                 print_warning("No campaigns found matching filters")
@@ -2210,57 +2109,69 @@ def negatives(
 
             print_info(f"Analysing search terms from {len(target_campaigns)} campaign(s) ({start_date} to {end_date})")
 
-            # Collect search term data across all campaigns
             all_terms: list[SearchTermAnalysis] = []
 
             with spinner("Pulling search term reports..."):
                 for camp in target_campaigns:
+                    if camp.id is None:
+                        continue
+                    camp_name = camp.name or str(camp.id)
                     try:
-                        report = client.reports.search_terms(
-                            campaign_id=camp.id,
-                            start_date=start_date,
-                            end_date=end_date,
-                            granularity=GranularityType.DAILY,
+                        req = AppsReportingRequest(
+                            filters=[
+                                ReportFilter(
+                                    field="campaignId",
+                                    operator=ReportFilterOperator.EQUALS,
+                                    value=str(camp.id),
+                                )
+                            ],
+                            time_range=ReportTimeRange(
+                                start=start_date,
+                                end=end_date,
+                                time_zone=ReportTimeZone.ORTZ,
+                                granularity=ReportGranularity.DAILY,
+                            ),
                         )
 
-                        if not report.row:
-                            continue
-
-                        # Aggregate by (search_term, ad_group_id) across daily rows
                         agg: dict[tuple[str, int], SearchTermAnalysis] = {}
-                        for row in report.row:
-                            if not row.total or not row.metadata.search_term_text:
+                        for row in client.reports.iter_search_terms(req):
+                            meta = row.metadata
+                            tm = row.total_metrics
+                            if not tm or not meta or not meta.search_term_text:
                                 continue
 
-                            key = (row.metadata.search_term_text, row.metadata.ad_group_id or 0)
-
+                            key = (meta.search_term_text, meta.ad_group_id or 0)
                             if key not in agg:
                                 spend_amt = (
-                                    Decimal(str(row.total.local_spend.amount))
-                                    if row.total.local_spend
+                                    Decimal(str(tm.local_spend.amount))
+                                    if tm.local_spend and tm.local_spend.amount is not None
                                     else Decimal("0")
                                 )
-                                currency = row.total.local_spend.currency if row.total.local_spend else "USD"
+                                currency = (
+                                    tm.local_spend.currency
+                                    if tm.local_spend and tm.local_spend.currency
+                                    else campaign_currency(camp)
+                                )
                                 agg[key] = SearchTermAnalysis(
-                                    search_term=row.metadata.search_term_text,
+                                    search_term=meta.search_term_text,
                                     campaign_id=camp.id,
-                                    campaign_name=camp.name,
-                                    ad_group_id=row.metadata.ad_group_id or 0,
-                                    ad_group_name=row.metadata.ad_group_name or "",
-                                    impressions=row.total.impressions or 0,
-                                    taps=row.total.taps or 0,
-                                    installs=row.total.tap_installs or 0,
+                                    campaign_name=camp_name,
+                                    ad_group_id=meta.ad_group_id or 0,
+                                    ad_group_name=meta.ad_group.name if meta.ad_group and meta.ad_group.name else "",
+                                    impressions=tm.impressions or 0,
+                                    taps=tm.taps or 0,
+                                    installs=tm.tap_installs or 0,
                                     spend=spend_amt,
                                     currency=currency,
-                                    matched_keyword=row.metadata.keyword,
+                                    matched_keyword=meta.keyword.text if meta.keyword else None,
                                 )
                             else:
                                 existing = agg[key]
-                                existing.impressions += row.total.impressions or 0
-                                existing.taps += row.total.taps or 0
-                                existing.installs += row.total.tap_installs or 0
-                                if row.total.local_spend:
-                                    existing.spend += Decimal(str(row.total.local_spend.amount))
+                                existing.impressions += tm.impressions or 0
+                                existing.taps += tm.taps or 0
+                                existing.installs += tm.tap_installs or 0
+                                if tm.local_spend and tm.local_spend.amount is not None:
+                                    existing.spend += Decimal(str(tm.local_spend.amount))
 
                         all_terms.extend(agg.values())
                     except AppleSearchAdsError:
@@ -2270,7 +2181,6 @@ def negatives(
                 print_warning("No search term data found for the specified period")
                 return
 
-            # Filter by thresholds
             if min_spend > 0:
                 all_terms = [t for t in all_terms if t.spend >= Decimal(str(min_spend))]
             if min_impressions > 0:
@@ -2280,16 +2190,12 @@ def negatives(
                 print_warning("No search terms match the specified thresholds")
                 return
 
-            # Sort by spend descending to prioritise highest waste
             all_terms.sort(key=lambda t: t.spend, reverse=True)
-
             print_info(f"Found {len(all_terms)} search terms to analyse")
 
-            # Build app context from campaign names
-            app_names = {c.name.split(" - ")[0].strip() for c in target_campaigns}
-            app_description = f"App: {', '.join(app_names)}" if app_names else "Unknown app"
+            app_names = {(c.name or "").split(" - ")[0].strip() for c in target_campaigns if c.name}
+            app_description = f"App: {', '.join(sorted(app_names))}" if app_names else "Unknown app"
 
-            # Process in batches (AI context limits)
             batch_size = 100
             all_suggestions: list[tuple[SearchTermAnalysis, NegativeSuggestion]] = []
 
@@ -2305,7 +2211,6 @@ def negatives(
                         print_error("AI Error", str(e))
                         raise typer.Exit(EXIT_ERROR) from None
 
-                # Match suggestions back to term data
                 suggestion_map = {s.search_term: s for s in result.suggestions}
                 for term in batch:
                     suggestion = suggestion_map.get(term.search_term)
@@ -2316,12 +2221,10 @@ def negatives(
                 print_warning("AI returned no suggestions")
                 return
 
-            # Separate by action
             negatives_list = [(t, s) for t, s in all_suggestions if s.action == "negative"]
             review_list = [(t, s) for t, s in all_suggestions if s.action == "review"]
             keep_list = [(t, s) for t, s in all_suggestions if s.action == "keep"]
 
-            # Display results
             console.print()
 
             if negatives_list:
@@ -2372,7 +2275,6 @@ def negatives(
                 console.print(table)
                 console.print()
 
-            # Summary
             total_negative_spend = sum(t.spend for t, _ in negatives_list)
             print_result_panel(
                 "Analysis Summary",
@@ -2385,11 +2287,8 @@ def negatives(
                 },
             )
 
-            # Export to CSV
             if output:
                 try:
-                    import csv
-
                     with open(output, "w", newline="") as f:
                         writer = csv.writer(f)
                         writer.writerow(
@@ -2427,7 +2326,6 @@ def negatives(
                 except Exception as e:
                     print_error("Export failed", str(e))
 
-            # Apply negatives
             if apply and not dry_run and negatives_list:
                 by_campaign: dict[int, list[tuple[SearchTermAnalysis, NegativeSuggestion]]] = defaultdict(list)
                 for term, suggestion in negatives_list:
@@ -2437,17 +2335,19 @@ def negatives(
                 for camp_id, items in by_campaign.items():
                     camp_name = items[0][0].campaign_name
                     neg_creates = [
-                        NegativeKeywordCreate(
+                        BulkNegativeKeywordCreate(
+                            campaign_id=camp_id,
                             text=term.search_term,
                             match_type=KeywordMatchType.EXACT,
+                            status=NegativeKeywordStatus.ENABLED,
                         )
                         for term, _ in items
                     ]
 
                     try:
                         with spinner(f"Adding {len(neg_creates)} negatives to '{camp_name}'..."):
-                            client.campaigns(camp_id).negative_keywords.create_bulk(neg_creates)
-                        total_added += len(neg_creates)
+                            results = client.bulk.create_negative_keywords(neg_creates, allow_partial_success=True)
+                        total_added += sum(1 for r in results if r.success)
                     except AppleSearchAdsError as e:
                         print_error(f"Failed to add negatives to '{camp_name}'", e.message)
 
