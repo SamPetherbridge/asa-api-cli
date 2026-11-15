@@ -108,15 +108,53 @@ asa countries list
 asa budget-orders list
 ```
 
-### Reports
+### Reports & Per-App Exports
 
 ```bash
+# Reconcilable, read-only per-app JSON exports for separate apps over a fixed period
+asa --ad-account 123456 reports export \
+  --app 654321987 --start 2026-01-01 --end 2026-01-07 --output app-654321987.json
+asa --ad-account 123456 reports export \
+  --app 789123456 --start 2026-01-01 --end 2026-01-07 --output app-789123456.json
+
 # Campaign, ad group, ad, keyword, and ORTZ search-term reports
 asa reports campaigns --start 2026-01-01 --end 2026-01-31
+asa reports campaigns --app 654321987 -s 2026-01-01 -e 2026-01-07 --daily -o daily.csv
 asa reports ad-groups 123456789 --days 14
 asa reports ads 123456789 --days 14
 asa reports keywords 123456789 --days 30
 asa reports search-terms 123456789 --days 14 --output search-terms.csv
+```
+
+#### `asa reports export` Contract
+
+`asa reports export` produces a single structured JSON document per app without invoking any mutating API endpoints:
+
+- **App & account isolation**: Scopes strictly to `--app <adamId>` within the resolved ad account (`--ad-account` / `ASA_AD_ACCOUNT_ID`), recording `account` (`ad_account_id`, `org_id`, `currency`, `account_timezone`), `app` (`adam_id`, `app_name`), `period`, `collected_at`, and `versions`. Repeat runs over the same `--start` / `--end` dates support downstream restatement diffing.
+- **Stable entity keys & daily reconciliation**: Emits both `daily` observations and `period_totals` across `campaigns`, `ad_groups`, `ads`, `keywords`, and `search_terms`, keyed by stable entity IDs (and parent IDs + dimensions on `search_terms`) rather than mutable names. Renamed entities reconcile by ID with historical names recorded in `observed_names`.
+- **Unambiguous attribution**: Exposes `tap_*` (`tap_installs`, `tap_new_downloads`, `tap_redownloads`, `tap_install_cpi`, `tap_install_rate`), `view_*` (`view_installs`, `view_new_downloads`, `view_redownloads`; CPI/rate remain `null` as Apple Ads does not define view-only CPI), and `total_*` (`total_installs`, `total_new_downloads`, `total_redownloads`, `total_avg_cpi`, `total_install_rate`). Period ratios are calculated from summed period numerators and denominators (never by averaging daily ratios), valid zeroes are preserved, and missing values stay `null`.
+- **Timezone policy**: `campaigns`, `ad_groups`, `ads`, and `keywords` support `--timezone ORTZ` (default) or `--timezone UTC`. `search_terms` is fixed to `ORTZ` by Apple Ads Platform API v1 (and limited to the trailing 90 days); under `--timezone UTC`, `search_terms` is marked `"status": "unavailable"` (`reason: "timezone_incompatible"`) by default rather than silently mixed with UTC daily data (pass `--include-ortz-search-terms` to opt into a separate ORTZ-tagged section).
+- **Completeness & exit codes**: Top-level `status` is `"complete"` or `"empty"` (`complete: true`, exit code `0`), or `"partial"` / `"failed"` (`complete: false`, exit code `1` with per-scope pagination and error records in `errors`). `--output` writes atomically on every outcome so stale files from earlier runs are never mistaken for current results.
+
+#### Read-Only Live Verification Procedure
+
+To verify per-app export reconciliation against a live account using read-only endpoints only:
+
+```bash
+# 1. Confirm read-only Platform API v1 connectivity and inspect accessible accounts/apps
+asa v1-smoke
+asa auth accounts
+asa apps search --own
+
+# 2. Export two apps separately over an explicit completed 7-day range (ORTZ)
+asa --ad-account "$ASA_AD_ACCOUNT_ID" reports export \
+  --app <APP_1_ADAM_ID> --start 2026-10-01 --end 2026-10-07 -o /tmp/app1.json
+asa --ad-account "$ASA_AD_ACCOUNT_ID" reports export \
+  --app <APP_2_ADAM_ID> --start 2026-10-01 --end 2026-10-07 -o /tmp/app2.json
+
+# 3. Verify completeness, zero cross-app campaign overlap, and daily-to-period reconciliation
+jq '{status, complete, app, reconciliation: .reconciliation.daily_to_period_matches, errors}' /tmp/app1.json /tmp/app2.json
+jq -s '(.[0].scope.campaign_ids - (.[0].scope.campaign_ids - .[1].scope.campaign_ids)) | length == 0' /tmp/app1.json /tmp/app2.json
 ```
 
 ### Recommendations, Suggestions & Change History
