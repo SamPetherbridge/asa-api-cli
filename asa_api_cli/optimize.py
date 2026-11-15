@@ -1675,6 +1675,8 @@ def analyze_cpa_cap_impact(
                             currency = perf_30d.get("currency", "USD")
 
                             # Parse CPA goal
+                            if ag.cpa_goal is None:
+                                continue
                             cpa_goal_amount = ag.cpa_goal.amount
                             if hasattr(cpa_goal_amount, "amount"):
                                 # Money object
@@ -1885,24 +1887,24 @@ def analyze_cpa_cap_impact(
                 console.print()
 
                 changes_made = 0
-                for i, ag in enumerate(problem_groups, 1):
+                for i, analysis in enumerate(problem_groups, 1):
                     console.rule(f"[bold]{i}/{len(problem_groups)}")
                     console.print()
 
                     # Show ad group details
-                    impact_color = "red" if ag.impact_level in ("BLOCKED", "CRITICAL") else "yellow"
-                    console.print(f"[bold]Ad Group:[/bold] {ag.ad_group_name}")
-                    console.print(f"[bold]Campaign:[/bold] {ag.campaign_name} ({ag.country})")
+                    impact_color = "red" if analysis.impact_level in ("BLOCKED", "CRITICAL") else "yellow"
+                    console.print(f"[bold]Ad Group:[/bold] {analysis.ad_group_name}")
+                    console.print(f"[bold]Campaign:[/bold] {analysis.campaign_name} ({analysis.country})")
                     console.print()
-                    cpa_str = f"{ag.cpa_goal:.2f} {ag.currency}"
+                    cpa_str = f"{analysis.cpa_goal:.2f} {analysis.currency}"
                     console.print(f"  CPA Goal:        [{impact_color}]{cpa_str}[/{impact_color}]")
-                    if ag.avg_cpa:
-                        console.print(f"  Actual Avg CPA:  {ag.avg_cpa:.2f} {ag.currency}")
-                    console.print(f"  Impressions 7d:  {ag.impressions_7d:,}")
-                    console.print(f"  Impressions 30d: {ag.impressions_30d:,}")
-                    console.print(f"  Taps 30d:        {ag.taps_30d:,}")
-                    console.print(f"  Installs 30d:    {ag.installs_30d:,}")
-                    console.print(f"  Impact:          [{impact_color}]{ag.impact_level}[/{impact_color}]")
+                    if analysis.avg_cpa:
+                        console.print(f"  Actual Avg CPA:  {analysis.avg_cpa:.2f} {analysis.currency}")
+                    console.print(f"  Impressions 7d:  {analysis.impressions_7d:,}")
+                    console.print(f"  Impressions 30d: {analysis.impressions_30d:,}")
+                    console.print(f"  Taps 30d:        {analysis.taps_30d:,}")
+                    console.print(f"  Installs 30d:    {analysis.installs_30d:,}")
+                    console.print(f"  Impact:          [{impact_color}]{analysis.impact_level}[/{impact_color}]")
                     console.print()
 
                     action = (
@@ -1928,20 +1930,20 @@ def analyze_cpa_cap_impact(
                             with spinner("Removing CPA goal..."):
                                 # Update ad group with cpa_goal set to remove it
                                 # Note: The API may require a specific way to clear the CPA goal
-                                client.campaigns(ag.campaign_id).ad_groups.update(
-                                    ag.ad_group_id,
+                                client.campaigns(analysis.campaign_id).ad_groups.update(
+                                    analysis.ad_group_id,
                                     AdGroupUpdate(cpa_goal=None),
                                 )
-                            print_success(f"Removed CPA goal from '{ag.ad_group_name}'")
+                            print_success(f"Removed CPA goal from '{analysis.ad_group_name}'")
                             changes_made += 1
                         except AppleSearchAdsError as e:
                             print_error("Failed to remove CPA goal", str(e))
                         console.print()
                     elif action in ("i", "increase"):
                         # Prompt for new CPA goal
-                        suggested = ag.cpa_goal * Decimal("1.5")  # Suggest 50% increase
+                        suggested = analysis.cpa_goal * Decimal("1.5")  # Suggest 50% increase
                         new_goal_str = typer.prompt(
-                            f"New CPA goal ({ag.currency})",
+                            f"New CPA goal ({analysis.currency})",
                             default=f"{suggested:.2f}",
                         )
                         try:
@@ -1953,13 +1955,17 @@ def analyze_cpa_cap_impact(
                             with spinner("Updating CPA goal..."):
                                 from asa_api_client.models import CpaGoal as CpaGoalModel
 
-                                client.campaigns(ag.campaign_id).ad_groups.update(
-                                    ag.ad_group_id,
+                                client.campaigns(analysis.campaign_id).ad_groups.update(
+                                    analysis.ad_group_id,
                                     AdGroupUpdate(
-                                        cpa_goal=CpaGoalModel(amount=Money(amount=str(new_goal), currency=ag.currency))
+                                        cpa_goal=CpaGoalModel(
+                                            amount=Money(amount=str(new_goal), currency=analysis.currency)
+                                        )
                                     ),
                                 )
-                            print_success(f"Updated CPA goal: {ag.cpa_goal:.2f} → {new_goal:.2f} {ag.currency}")
+                            print_success(
+                                f"Updated CPA goal: {analysis.cpa_goal:.2f} → {new_goal:.2f} {analysis.currency}"
+                            )
                             changes_made += 1
                         except ValueError:
                             print_warning(f"Invalid input '{new_goal_str}', skipping")

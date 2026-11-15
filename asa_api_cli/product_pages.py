@@ -24,6 +24,10 @@ LOCALE_COLUMNS = ["language_code", "language", "app_name", "device_classes"]
 
 @app.command("list")
 def list_product_pages(
+    adam_id: Annotated[
+        int,
+        typer.Option("--adam-id", "-a", help="App Store app ID (adamId)"),
+    ],
     limit: Annotated[
         int,
         typer.Option("--limit", "-l", help="Maximum number of results"),
@@ -33,18 +37,18 @@ def list_product_pages(
         typer.Option("--format", "-f", help="Output format"),
     ] = OutputFormat.TABLE,
 ) -> None:
-    """List custom product pages.
+    """List custom product pages for an app.
 
     Examples:
-        asa product-pages list
-        asa product-pages list --format json
+        asa product-pages list --adam-id 123456789
+        asa product-pages list -a 123456789 --format json
     """
     client = get_client()
 
     try:
         with client:
             with spinner("Fetching product pages..."):
-                result = client.product_pages.list(limit=limit)
+                result = client.product_pages(adam_id).list(limit=limit)
 
             if not result.data:
                 print_warning("No product pages found")
@@ -73,18 +77,22 @@ def get_product_page(
         str,
         typer.Argument(help="Product page ID"),
     ],
+    adam_id: Annotated[
+        int,
+        typer.Option("--adam-id", "-a", help="App Store app ID (adamId)"),
+    ],
 ) -> None:
     """Show details for a single custom product page.
 
     Example:
-        asa product-pages get <product-page-id>
+        asa product-pages get <product-page-id> --adam-id 123456789
     """
     client = get_client()
 
     try:
         with client:
             with spinner("Fetching product page..."):
-                pp = client.product_pages.get(product_page_id)
+                pp = client.product_pages(adam_id).get(product_page_id)
 
             print_result_panel(
                 f"Product page {pp.id}",
@@ -106,6 +114,10 @@ def product_page_locales(
         str,
         typer.Argument(help="Product page ID"),
     ],
+    adam_id: Annotated[
+        int,
+        typer.Option("--adam-id", "-a", help="App Store app ID (adamId)"),
+    ],
     format: Annotated[
         OutputFormat,
         typer.Option("--format", "-f", help="Output format"),
@@ -114,14 +126,14 @@ def product_page_locales(
     """List the per-locale details of a custom product page.
 
     Example:
-        asa product-pages locales <product-page-id>
+        asa product-pages locales <product-page-id> --adam-id 123456789
     """
     client = get_client()
 
     try:
         with client:
             with spinner("Fetching locale details..."):
-                details = client.product_pages.get_locale_details(product_page_id)
+                details = client.product_pages(adam_id).get_locale_details(product_page_id)
 
             if not details:
                 print_warning("No locale details found")

@@ -122,7 +122,7 @@ def handle_api_error(e: AppleSearchAdsError) -> None:
     Args:
         e: The exception to handle.
     """
-    from asa_api_client.exceptions import ValidationError
+    from asa_api_client.exceptions import PartialFailureError, ValidationError
 
     details_parts = []
 
@@ -139,10 +139,18 @@ def handle_api_error(e: AppleSearchAdsError) -> None:
             for err in errors:
                 details_parts.append(f"  {field}: {err}")
 
+    # Show per-item error entries for partial failures (2xx with error block)
+    if isinstance(e, PartialFailureError) and e.details:
+        for item in e.details:
+            field_name = item.get("field")
+            code = item.get("messageCode") or item.get("code")
+            msg = item.get("message") or code or json.dumps(item)
+            prefix = f"{field_name}: " if field_name else ""
+            suffix = f" ({code})" if code and code != msg else ""
+            details_parts.append(f"  {prefix}{msg}{suffix}")
+
     # Show response body if available (for debugging)
     if e.response_body:
-        import json
-
         # Remove internal _request field before displaying
         body_copy = {k: v for k, v in e.response_body.items() if not k.startswith("_")}
         body_str = json.dumps(body_copy, indent=2)

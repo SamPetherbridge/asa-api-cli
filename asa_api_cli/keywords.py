@@ -221,7 +221,7 @@ def add_keyword(
                 {
                     "ID": str(keyword.id),
                     "Text": keyword.text,
-                    "Match Type": keyword.match_type.value,
+                    "Match Type": enum_value(keyword.match_type),
                 },
             )
             print_hint(f"asa keywords list --campaign {campaign_id} --ad-group {ad_group_id}")
@@ -454,8 +454,8 @@ def list_negatives(
                 {
                     "id": n.id,
                     "text": n.text,
-                    "match_type": n.match_type.value,
-                    "status": n.status.value,
+                    "match_type": enum_value(n.match_type),
+                    "status": enum_value(n.status),
                 }
                 for n in negatives
             ]
@@ -519,7 +519,7 @@ def add_negative(
                 {
                     "Level": level.title(),
                     "Text": negative.text,
-                    "Match Type": negative.match_type.value,
+                    "Match Type": enum_value(negative.match_type),
                 },
             )
             hint_args = f"--campaign {campaign_id}"

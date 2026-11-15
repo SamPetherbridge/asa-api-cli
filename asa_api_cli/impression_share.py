@@ -224,8 +224,11 @@ def analyze_impression_share(
                 poll_interval=3.0,
                 timeout=120.0,
             )
-        except Exception as e:
+        except AppleSearchAdsError as e:
             handle_api_error(e)
+            return
+        except (TimeoutError, RuntimeError) as e:
+            print_error("Report Error", str(e))
             return
 
     if not report.row:
@@ -359,8 +362,11 @@ def generate_share_report(
                 poll_interval=3.0,
                 timeout=120.0,
             )
-        except Exception as e:
+        except AppleSearchAdsError as e:
             handle_api_error(e)
+            return
+        except (TimeoutError, RuntimeError) as e:
+            print_error("Report Error", str(e))
             return
 
     if not report.row:
@@ -444,8 +450,11 @@ def share_summary(
                 poll_interval=3.0,
                 timeout=120.0,
             )
-        except Exception as e:
+        except AppleSearchAdsError as e:
             handle_api_error(e)
+            return
+        except (TimeoutError, RuntimeError) as e:
+            print_error("Report Error", str(e))
             return
 
     if not report.row:

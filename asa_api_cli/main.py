@@ -3,6 +3,7 @@
 from typing import Annotated
 
 import typer
+from asa_api_client.cli import v1_smoke
 
 from asa_api_cli import (
     ad_groups,
@@ -21,13 +22,45 @@ from asa_api_cli import (
     reports,
     translate,
 )
-from asa_api_cli.utils import cli_state, error_console, init_consoles
+from asa_api_cli.utils import EXIT_ERROR, cli_state, error_console, init_consoles, print_error
 
 app = typer.Typer(
     name="asa",
     help="Apple Search Ads API CLI - Manage campaigns, ad groups, keywords, and reports.",
     rich_markup_mode="rich",
 )
+
+
+def _register_analyze_command(target_app: typer.Typer) -> None:
+    """Register ``asa analyze`` from asa-api-client, or a clean install-hint fallback."""
+    try:
+        from asa_api_client.cli.analyze import analyze as analyze_command
+    except ImportError:
+
+        @target_app.command(
+            "analyze",
+            help="Generate an Excel performance analysis workbook (requires [analyze] extra)",
+            context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+        )
+        def _analyze_missing_extra() -> None:
+            """Generate an Excel performance analysis workbook.
+
+            Requires optional dependencies (pandas and xlsxwriter).
+            """
+            print_error(
+                "Missing Optional Dependencies",
+                "The 'analyze' command requires pandas and xlsxwriter.",
+                details=('Install with: pip install "asa-api-cli[analyze]" or uv tool install "asa-api-cli[analyze]"'),
+            )
+            raise typer.Exit(EXIT_ERROR)
+
+        return
+
+    target_app.command(
+        "analyze",
+        help="Generate an Excel performance analysis workbook",
+    )(analyze_command)
+
 
 # Register sub-commands
 app.add_typer(auth.app, name="auth", help="Authentication commands")
@@ -45,6 +78,11 @@ app.add_typer(reports.app, name="reports", help="Generate reports")
 app.add_typer(optimize.app, name="optimize", help="Optimization tools")
 app.add_typer(impression_share.app, name="impression-share", help="Impression share analysis")
 app.add_typer(translate.app, name="translate", help="Translate keywords to multiple languages")
+_register_analyze_command(app)
+app.command(
+    "v1-smoke",
+    help="Run a read-only smoke test against the Apple Ads Platform API v1",
+)(v1_smoke.command)
 
 
 def version_callback(value: bool) -> None:
