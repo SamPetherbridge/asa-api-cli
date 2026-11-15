@@ -4,14 +4,15 @@ build-backend = "hatchling.build"
 
 [project]
 name = "asa-api-cli"
-version = "0.4.0"
-description = "Command-line interface for Apple Search Ads campaign management"
+version = "0.5.0"
+description = "Command-line interface for Apple Ads Platform API v1"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.13"
 authors = [{ name = "Sam Petherbridge", email = "hello@peth.me" }]
 keywords = [
     "apple",
+    "apple-ads",
     "search-ads",
     "advertising",
     "cli",

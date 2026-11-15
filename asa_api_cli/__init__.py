@@ -1,11 +1,11 @@
-"""Command-line interface for Apple Search Ads.
+"""Command-line interface for Apple Ads Platform API v1.
 
-This module provides a CLI for interacting with the Apple Search Ads API.
+This module provides a CLI for interacting with the Apple Ads Platform API v1.
 
 Usage:
     asa --help
     asa campaigns list
-    asa reports campaigns --start 2024-01-01 --end 2024-01-31
+    asa reports export --app 654321987 --start 2026-01-01 --end 2026-01-07 -o app-report.json
 """
 
 from importlib.metadata import PackageNotFoundError, version
