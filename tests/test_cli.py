@@ -1,15 +1,23 @@
 """Tests for the CLI application."""
 
+import importlib.metadata
 import io
+import os
+import shutil
+import subprocess
 import sys
+import tomllib
+from pathlib import Path
 from types import ModuleType
 from unittest.mock import MagicMock
 
+import hatchling.build
 import pytest
 import typer
 from asa_api_client.exceptions import PartialFailureError
 from asa_api_client.v1.models.base import V1Page, V1Pagination
 from asa_api_client.v1.models.product_pages import ProductPageDetails
+from packaging.requirements import Requirement
 from rich.console import Console
 from typer.testing import CliRunner
 
@@ -281,3 +289,151 @@ def test_pydantic_ai_agents_construct() -> None:
         assert t_agent is not None
         n_agent = _get_negative_analysis_agent(settings=settings, provider=provider)
         assert n_agent is not None
+
+
+def test_pyproject_rejects_conflicting_client_releases() -> None:
+    """Issue #74: Dependency bounds exclude asa-api-client<=1.0.0 that claimed the `asa` script."""
+    repo_root = Path(__file__).resolve().parents[1]
+    pyproject = tomllib.loads((repo_root / "pyproject.toml").read_text(encoding="utf-8"))
+
+    assert pyproject["project"]["scripts"] == {"asa": "asa_api_cli:app"}
+
+    core_reqs = [Requirement(r) for r in pyproject["project"]["dependencies"]]
+    client_core = next(r for r in core_reqs if r.name == "asa-api-client")
+    assert not client_core.specifier.contains("0.6.1")
+    assert not client_core.specifier.contains("1.0.0")
+    assert client_core.specifier.contains("1.0.1")
+
+    analyze_reqs = [Requirement(r) for r in pyproject["project"]["optional-dependencies"]["analyze"]]
+    client_analyze = next(r for r in analyze_reqs if r.name == "asa-api-client")
+    assert "cli" in client_analyze.extras
+    assert not client_analyze.specifier.contains("1.0.0")
+    assert client_analyze.specifier.contains("1.0.1")
+
+    client_eps = [
+        ep.name
+        for ep in importlib.metadata.distribution("asa-api-client").entry_points
+        if ep.group == "console_scripts"
+    ]
+    assert "asa" not in client_eps
+    assert "asa-client" in client_eps
+
+
+def _assert_installed_asa_surface(asa_bin: Path, outside_dir: Path, clean_env: dict[str, str]) -> None:
+    """Verify executable identity and core CLI/analyze help from outside the source checkout."""
+    ver = subprocess.run([str(asa_bin), "--version"], cwd=outside_dir, env=clean_env, capture_output=True, text=True)
+    assert ver.returncode == 0, ver.stderr
+    assert ver.stdout.startswith("asa-api-cli ")
+    assert "(asa-api-client " in ver.stdout
+
+    root_help = subprocess.run([str(asa_bin), "--help"], cwd=outside_dir, env=clean_env, capture_output=True, text=True)
+    assert root_help.returncode == 0, root_help.stderr
+    for expected_cmd in ("reports", "auth", "analyze", "v1-smoke"):
+        assert expected_cmd in root_help.stdout
+
+    rep_help = subprocess.run(
+        [str(asa_bin), "reports", "export", "--help"],
+        cwd=outside_dir,
+        env=clean_env,
+        capture_output=True,
+        text=True,
+    )
+    assert rep_help.returncode == 0, rep_help.stderr
+    assert "--app" in rep_help.stdout
+
+    auth_help = subprocess.run(
+        [str(asa_bin), "auth", "--help"],
+        cwd=outside_dir,
+        env=clean_env,
+        capture_output=True,
+        text=True,
+    )
+    assert auth_help.returncode == 0, auth_help.stderr
+    assert "accounts" in auth_help.stdout
+
+    analyze_help = subprocess.run(
+        [str(asa_bin), "analyze", "--help"],
+        cwd=outside_dir,
+        env=clean_env,
+        capture_output=True,
+        text=True,
+    )
+    assert analyze_help.returncode == 0, analyze_help.stderr
+    assert "--period" in analyze_help.stdout
+    assert "--output" in analyze_help.stdout
+
+
+def _uv_pip_install(uv_bin: str, venv_python: Path, outside_dir: Path, args: list[str]) -> None:
+    """Install packages into an isolated venv, preferring uv's offline wheel cache first."""
+    base_cmd = [uv_bin, "pip", "install", "--python", str(venv_python)]
+    offline = subprocess.run([*base_cmd, "--offline", *args], cwd=outside_dir, capture_output=True, text=True)
+    if offline.returncode == 0:
+        return
+    online = subprocess.run([*base_cmd, *args], cwd=outside_dir, capture_output=True, text=True)
+    assert online.returncode == 0, f"uv pip install failed:\n{offline.stderr}\n{online.stderr}"
+
+
+def test_isolated_install_with_analyze_extra_and_client_reinstall_preserves_asa(tmp_path: Path) -> None:
+    """Issue #74: Fresh isolated install + reinstalling asa-api-client preserves the `asa` command."""
+    uv_bin = shutil.which("uv")
+    assert uv_bin is not None, "uv is required to run isolated installation smoke tests"
+
+    repo_root = Path(__file__).resolve().parents[1]
+    wheels_dir = tmp_path / "wheels"
+    wheels_dir.mkdir()
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+    venv_dir = tmp_path / "isolated-venv"
+
+    prev_cwd = Path.cwd()
+    try:
+        os.chdir(repo_root)
+        wheel_name = hatchling.build.build_wheel(str(wheels_dir))
+    finally:
+        os.chdir(prev_cwd)
+    wheel_path = wheels_dir / wheel_name
+    assert wheel_path.is_file()
+
+    subprocess.run(
+        [uv_bin, "venv", "--no-project", "--python", sys.executable, str(venv_dir)],
+        cwd=outside_dir,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    bin_dir = venv_dir / ("Scripts" if os.name == "nt" else "bin")
+    exe_suffix = ".exe" if os.name == "nt" else ""
+    venv_python = bin_dir / f"python{exe_suffix}"
+    asa_bin = bin_dir / f"asa{exe_suffix}"
+    asa_client_bin = bin_dir / f"asa-client{exe_suffix}"
+
+    # 1. Fresh install of built asa-api-cli[analyze] wheel into isolated venv
+    _uv_pip_install(uv_bin, venv_python, outside_dir, [f"asa-api-cli[analyze] @ {wheel_path.as_uri()}"])
+
+    clean_env = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH", "VIRTUAL_ENV")}
+    clean_env["PYTHONNOUSERSITE"] = "1"
+    clean_env["NO_COLOR"] = "1"
+
+    assert asa_bin.is_file()
+    assert asa_client_bin.is_file()
+    _assert_installed_asa_surface(asa_bin, outside_dir, clean_env)
+
+    client_help = subprocess.run(
+        [str(asa_client_bin), "--help"],
+        cwd=outside_dir,
+        env=clean_env,
+        capture_output=True,
+        text=True,
+    )
+    assert client_help.returncode == 0, client_help.stderr
+    assert "analyze" in client_help.stdout
+    assert "smoke" in client_help.stdout
+
+    # 2. Reinstall supported asa-api-client dependency and verify `asa` was NOT overwritten
+    _uv_pip_install(
+        uv_bin,
+        venv_python,
+        outside_dir,
+        ["--reinstall-package", "asa-api-client", "asa-api-client[cli]>=1.0.1"],
+    )
+    _assert_installed_asa_surface(asa_bin, outside_dir, clean_env)

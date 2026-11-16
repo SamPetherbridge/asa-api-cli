@@ -181,6 +181,34 @@ class ScopeDiscoveryResult:
     errors: list[dict[str, Any]] = field(default_factory=list)
 
 
+@dataclass
+class _EntityWindowBucket:
+    """Per-(entity, fetch_window) accumulator for API-total vs daily reconciliation."""
+
+    level: str
+    entity_key: tuple[Any, ...]
+    entity_info: dict[str, Any]
+    campaign_id: int | None
+    window_start: date
+    window_end: date
+    timezone: str
+    daily_rows: list[dict[str, Any]] = field(default_factory=list)
+    daily_raw_spends: list[Decimal | None] = field(default_factory=list)
+    daily_explicit_currencies: set[str] = field(default_factory=set)
+    total_metrics: AppsMetrics | None = None
+    total_explicit_currency: str | None = None
+    used_total_fallback: bool = False
+    had_row_error: bool = False
+    conflicting_total_metrics: bool = False
+
+
+SPEND_COMPARISON_SPEC: dict[str, str] = {
+    "type": "decimal",
+    "precision": "exact_decimal",
+    "tolerance": "0",
+}
+
+
 def _cli_version() -> str:
     """Return installed ``asa-api-cli`` version."""
     try:
@@ -228,6 +256,43 @@ def _format_decimal(
     return f"{whole}.{trimmed}"
 
 
+def _format_exact_decimal(value: Decimal) -> str:
+    """Format an exact Decimal with at least 2 fractional digits and no rounding loss."""
+    text = f"{value:f}"
+    whole, dot, frac = text.partition(".")
+    if not dot:
+        return f"{whole}.00"
+    trimmed = frac.rstrip("0")
+    if len(trimmed) < 2:
+        trimmed = trimmed.ljust(2, "0")
+    return f"{whole}.{trimmed}"
+
+
+def _explicit_metrics_currency(metrics: AppsMetrics) -> str | None:
+    """Return the first explicit ISO currency code present on an ``AppsMetrics`` container."""
+    for money_obj in (
+        metrics.local_spend,
+        metrics.cpt,
+        metrics.cpm,
+        metrics.tap_install_cpi,
+        metrics.total_avg_cpi,
+    ):
+        if money_obj is not None and money_obj.currency:
+            return money_obj.currency
+    return None
+
+
+def _entity_dict(level: str, row_or_meta: dict[str, Any]) -> dict[str, Any]:
+    """Return a stable entity-key dictionary for structured error and reconciliation reporting."""
+    return {k: row_or_meta.get(k) for k in ENTITY_KEY_FIELDS[level]}
+
+
+def _format_entity_label(entity: dict[str, Any]) -> str:
+    """Format non-null stable entity identifiers for human-readable error diagnostics."""
+    parts = [f"{k}={v!r}" for k, v in entity.items() if v is not None]
+    return ", ".join(parts) if parts else repr(entity)
+
+
 def _error_dict(
     *,
     scope: str,
@@ -239,9 +304,12 @@ def _error_dict(
     window_start: date | None = None,
     window_end: date | None = None,
     offset: int | None = None,
+    entity: dict[str, Any] | None = None,
+    observed_date: date | None = None,
+    mismatches: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Build a structured, machine-readable error record."""
-    return {
+    rec: dict[str, Any] = {
         "scope": scope,
         "level": level,
         "campaign_id": campaign_id,
@@ -252,6 +320,13 @@ def _error_dict(
         "status_code": status_code,
         "message": message,
     }
+    if entity is not None:
+        rec["entity"] = entity
+    if observed_date is not None:
+        rec["observed_date"] = observed_date.isoformat()
+    if mismatches is not None:
+        rec["mismatches"] = mismatches
+    return rec
 
 
 def _compute_derived_metrics(
@@ -313,17 +388,7 @@ def serialize_apps_metrics(
     values remain ``None`` and are never fabricated into zeroes.
     """
     spend_dec = _parse_decimal(metrics.local_spend.amount) if metrics.local_spend else None
-    detected_currency: str | None = None
-    for money_obj in (
-        metrics.local_spend,
-        metrics.cpt,
-        metrics.cpm,
-        metrics.tap_install_cpi,
-        metrics.total_avg_cpi,
-    ):
-        if money_obj is not None and money_obj.currency:
-            detected_currency = money_obj.currency
-            break
+    detected_currency = _explicit_metrics_currency(metrics)
     currency = detected_currency or default_currency
 
     derived = _compute_derived_metrics(
@@ -1018,10 +1083,363 @@ def _build_period_totals_and_summary(
     return period_totals, summary, notes
 
 
-def _reconcile_levels(levels_payload: dict[str, dict[str, Any]]) -> dict[str, Any]:
-    """Verify daily-to-period mathematical reconciliation and cross-level coverage vs campaigns."""
+def _total_metrics_equivalent(a: AppsMetrics, b: AppsMetrics) -> bool:
+    """Return True when two ``AppsMetrics`` containers carry identical additive counts, spend, and currency."""
+    for int_field in ADDITIVE_INT_FIELDS:
+        if getattr(a, int_field, None) != getattr(b, int_field, None):
+            return False
+    a_spend = _parse_decimal(a.local_spend.amount) if a.local_spend is not None else None
+    b_spend = _parse_decimal(b.local_spend.amount) if b.local_spend is not None else None
+    if a_spend != b_spend:
+        return False
+    return _explicit_metrics_currency(a) == _explicit_metrics_currency(b)
+
+
+def _not_checked_api_totals_summary(reason: str) -> dict[str, Any]:
+    """Build an explicit ``not_checked`` API-totals reconciliation block."""
+    return {
+        "status": "not_checked",
+        "matches": None,
+        "not_checked_reason": reason,
+        "entity_windows_seen": 0,
+        "checked_entity_windows": 0,
+        "not_checked_entity_windows": 0,
+        "mismatched_entity_windows": 0,
+        "mismatches": [],
+        "checks": [],
+    }
+
+
+def _evaluate_level_api_totals(
+    level: str,
+    buckets: dict[tuple[tuple[Any, ...], date, date], _EntityWindowBucket],
+    *,
+    default_currency: str | None,
+    level_errors: list[dict[str, Any]],
+    all_errors: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Compare independent API ``totalMetrics`` against summed daily ``granularMetrics`` per entity and window."""
+    if not buckets:
+        return _not_checked_api_totals_summary("no_rows")
+
+    sorted_keys = sorted(
+        buckets.keys(),
+        key=lambda item: (
+            tuple("" if x is None else str(x) for x in item[0]),
+            item[1].isoformat(),
+            item[2].isoformat(),
+        ),
+    )
+
+    checks: list[dict[str, Any]] = []
+    mismatches: list[dict[str, Any]] = []
+
+    for b_key in sorted_keys:
+        bucket = buckets[b_key]
+        entity_label = _format_entity_label(bucket.entity_info)
+        check_currency = (
+            bucket.total_explicit_currency
+            or (
+                next(iter(sorted(bucket.daily_explicit_currencies)))
+                if len(bucket.daily_explicit_currencies) == 1
+                else None
+            )
+            or default_currency
+        )
+
+        if bucket.conflicting_total_metrics:
+            conflict_fields = [
+                {
+                    "field": "total_metrics",
+                    "expected": "consistent_per_window",
+                    "observed": "conflicting_duplicate_rows",
+                    "delta": None,
+                }
+            ]
+            mismatch_record: dict[str, Any] = {
+                "level": level,
+                "campaign_id": bucket.campaign_id,
+                "entity": bucket.entity_info,
+                "window_start": bucket.window_start.isoformat(),
+                "window_end": bucket.window_end.isoformat(),
+                "timezone": bucket.timezone,
+                "currency": check_currency,
+                "field_mismatches": conflict_fields,
+                "compared_fields": [],
+                "skipped_fields": [],
+                "skipped_field_reasons": {},
+            }
+            mismatches.append(mismatch_record)
+            checks.append(
+                {
+                    "entity": bucket.entity_info,
+                    "window_start": bucket.window_start.isoformat(),
+                    "window_end": bucket.window_end.isoformat(),
+                    "timezone": bucket.timezone,
+                    "currency": check_currency,
+                    "comparable": True,
+                    "status": "mismatched",
+                    "matches": False,
+                    "not_checked_reason": None,
+                    "compared_fields": [],
+                    "skipped_fields": [],
+                    "skipped_field_reasons": {},
+                    "field_mismatches": conflict_fields,
+                }
+            )
+            conflict_err = _error_dict(
+                scope="reconciliation",
+                level=level,
+                campaign_id=bucket.campaign_id,
+                window_start=bucket.window_start,
+                window_end=bucket.window_end,
+                entity=bucket.entity_info,
+                mismatches=conflict_fields,
+                error_type="ApiTotalMismatchError",
+                message=(
+                    f"{level} report returned conflicting totalMetrics across duplicate rows for {entity_label} "
+                    f"in window {bucket.window_start.isoformat()}..{bucket.window_end.isoformat()}."
+                ),
+            )
+            level_errors.append(conflict_err)
+            all_errors.append(conflict_err)
+            continue
+
+        skip_reason: str | None = None
+        if bucket.used_total_fallback:
+            skip_reason = "used_as_daily_fallback"
+        elif bucket.total_metrics is None:
+            skip_reason = "missing_total_metrics"
+        elif bucket.had_row_error or not bucket.daily_rows:
+            skip_reason = "incomplete_window_observations"
+        elif len(bucket.daily_explicit_currencies) > 1 or (
+            bucket.total_explicit_currency is not None
+            and bool(bucket.daily_explicit_currencies)
+            and bucket.total_explicit_currency not in bucket.daily_explicit_currencies
+        ):
+            skip_reason = "currency_mismatch"
+        elif bucket.total_metrics.date is not None and (
+            bucket.total_metrics.date < bucket.window_start or bucket.total_metrics.date > bucket.window_end
+        ):
+            skip_reason = "out_of_window_total_date"
+
+        if skip_reason is not None or bucket.total_metrics is None:
+            checks.append(
+                {
+                    "entity": bucket.entity_info,
+                    "window_start": bucket.window_start.isoformat(),
+                    "window_end": bucket.window_end.isoformat(),
+                    "timezone": bucket.timezone,
+                    "currency": check_currency,
+                    "comparable": False,
+                    "status": "not_checked",
+                    "matches": None,
+                    "not_checked_reason": skip_reason or "missing_total_metrics",
+                    "compared_fields": [],
+                    "skipped_fields": [*ADDITIVE_INT_FIELDS, "local_spend"],
+                    "skipped_field_reasons": {},
+                    "field_mismatches": [],
+                }
+            )
+            continue
+
+        compared_fields: list[str] = []
+        skipped_fields: list[str] = []
+        skipped_field_reasons: dict[str, str] = {}
+        field_mismatches: list[dict[str, Any]] = []
+
+        for int_field in ADDITIVE_INT_FIELDS:
+            daily_val = _sum_int_values([r.get(int_field) for r in bucket.daily_rows], int_field, [])
+            api_val: int | None = getattr(bucket.total_metrics, int_field, None)
+            if api_val is None and daily_val is None:
+                skipped_fields.append(int_field)
+                skipped_field_reasons[int_field] = "both_null"
+            elif api_val is None:
+                skipped_fields.append(int_field)
+                skipped_field_reasons[int_field] = "api_total_null"
+            elif daily_val is None:
+                skipped_fields.append(int_field)
+                skipped_field_reasons[int_field] = "daily_null"
+            else:
+                compared_fields.append(int_field)
+                if daily_val != api_val:
+                    field_mismatches.append(
+                        {
+                            "field": int_field,
+                            "expected": api_val,
+                            "observed": daily_val,
+                            "delta": daily_val - api_val,
+                        }
+                    )
+
+        daily_spend = _sum_decimal_values(bucket.daily_raw_spends, "local_spend", [])
+        api_spend = (
+            _parse_decimal(bucket.total_metrics.local_spend.amount)
+            if bucket.total_metrics.local_spend is not None
+            else None
+        )
+        if api_spend is None and daily_spend is None:
+            skipped_fields.append("local_spend")
+            skipped_field_reasons["local_spend"] = "both_null"
+        elif api_spend is None:
+            skipped_fields.append("local_spend")
+            skipped_field_reasons["local_spend"] = "api_total_null"
+        elif daily_spend is None:
+            skipped_fields.append("local_spend")
+            skipped_field_reasons["local_spend"] = "daily_null"
+        else:
+            compared_fields.append("local_spend")
+            if daily_spend != api_spend:
+                field_mismatches.append(
+                    {
+                        "field": "local_spend",
+                        "expected": _format_exact_decimal(api_spend),
+                        "observed": _format_exact_decimal(daily_spend),
+                        "delta": _format_exact_decimal(daily_spend - api_spend),
+                    }
+                )
+
+        if not compared_fields:
+            checks.append(
+                {
+                    "entity": bucket.entity_info,
+                    "window_start": bucket.window_start.isoformat(),
+                    "window_end": bucket.window_end.isoformat(),
+                    "timezone": bucket.timezone,
+                    "currency": check_currency,
+                    "comparable": False,
+                    "status": "not_checked",
+                    "matches": None,
+                    "not_checked_reason": "no_comparable_fields",
+                    "compared_fields": [],
+                    "skipped_fields": skipped_fields,
+                    "skipped_field_reasons": skipped_field_reasons,
+                    "field_mismatches": [],
+                }
+            )
+            continue
+
+        if field_mismatches:
+            mismatch_record = {
+                "level": level,
+                "campaign_id": bucket.campaign_id,
+                "entity": bucket.entity_info,
+                "window_start": bucket.window_start.isoformat(),
+                "window_end": bucket.window_end.isoformat(),
+                "timezone": bucket.timezone,
+                "currency": check_currency,
+                "field_mismatches": field_mismatches,
+                "compared_fields": compared_fields,
+                "skipped_fields": skipped_fields,
+                "skipped_field_reasons": skipped_field_reasons,
+            }
+            mismatches.append(mismatch_record)
+            checks.append(
+                {
+                    "entity": bucket.entity_info,
+                    "window_start": bucket.window_start.isoformat(),
+                    "window_end": bucket.window_end.isoformat(),
+                    "timezone": bucket.timezone,
+                    "currency": check_currency,
+                    "comparable": True,
+                    "status": "mismatched",
+                    "matches": False,
+                    "not_checked_reason": None,
+                    "compared_fields": compared_fields,
+                    "skipped_fields": skipped_fields,
+                    "skipped_field_reasons": skipped_field_reasons,
+                    "field_mismatches": field_mismatches,
+                }
+            )
+            summary_parts = [
+                f"{m['field']} (expected {m['expected']}, observed {m['observed']})" for m in field_mismatches
+            ]
+            mismatch_err = _error_dict(
+                scope="reconciliation",
+                level=level,
+                campaign_id=bucket.campaign_id,
+                window_start=bucket.window_start,
+                window_end=bucket.window_end,
+                entity=bucket.entity_info,
+                mismatches=field_mismatches,
+                error_type="ApiTotalMismatchError",
+                message=(
+                    f"{level} daily metrics did not match API totalMetrics for {entity_label} "
+                    f"in window {bucket.window_start.isoformat()}..{bucket.window_end.isoformat()}: "
+                    f"{'; '.join(summary_parts)}."
+                ),
+            )
+            level_errors.append(mismatch_err)
+            all_errors.append(mismatch_err)
+        else:
+            checks.append(
+                {
+                    "entity": bucket.entity_info,
+                    "window_start": bucket.window_start.isoformat(),
+                    "window_end": bucket.window_end.isoformat(),
+                    "timezone": bucket.timezone,
+                    "currency": check_currency,
+                    "comparable": True,
+                    "status": "matched",
+                    "matches": True,
+                    "not_checked_reason": None,
+                    "compared_fields": compared_fields,
+                    "skipped_fields": skipped_fields,
+                    "skipped_field_reasons": skipped_field_reasons,
+                    "field_mismatches": [],
+                }
+            )
+
+    seen_count = len(checks)
+    checked_count = sum(1 for c in checks if c["comparable"])
+    not_checked_count = sum(1 for c in checks if not c["comparable"])
+    mismatched_count = sum(1 for c in checks if c["status"] == "mismatched")
+
+    if mismatched_count > 0:
+        lvl_status = "mismatched"
+        lvl_matches: bool | None = False
+        lvl_reason: str | None = None
+    elif checked_count == 0:
+        lvl_status = "not_checked"
+        lvl_matches = None
+        reasons = {str(c["not_checked_reason"]) for c in checks if c.get("not_checked_reason")}
+        lvl_reason = next(iter(reasons)) if len(reasons) == 1 else "non_comparable_api_totals"
+    elif not_checked_count > 0:
+        lvl_status = "partially_checked"
+        lvl_matches = None
+        lvl_reason = "partial_api_totals_coverage"
+    else:
+        lvl_status = "matched"
+        lvl_matches = True
+        lvl_reason = None
+
+    return {
+        "status": lvl_status,
+        "matches": lvl_matches,
+        "not_checked_reason": lvl_reason,
+        "entity_windows_seen": seen_count,
+        "checked_entity_windows": checked_count,
+        "not_checked_entity_windows": not_checked_count,
+        "mismatched_entity_windows": mismatched_count,
+        "mismatches": mismatches,
+        "checks": checks,
+    }
+
+
+def _reconcile_levels(
+    levels_payload: dict[str, dict[str, Any]],
+    *,
+    level_api_totals: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Verify internal daily-to-period aggregation, independent API-total reconciliation, and cross-level coverage."""
     all_daily_match = True
     level_reconciliations: dict[str, Any] = {}
+
+    total_seen = 0
+    total_checked = 0
+    total_not_checked = 0
+    total_mismatched = 0
+    all_api_mismatches: list[dict[str, Any]] = []
 
     campaigns_section = levels_payload["campaigns"]
     campaigns_comparable = campaigns_section["complete"] and campaigns_section["status"] in ("complete", "empty")
@@ -1034,15 +1452,23 @@ def _reconcile_levels(levels_payload: dict[str, dict[str, Any]]) -> dict[str, An
         discrepancies: list[str] = []
 
         if sec["status"] in ("unavailable", "failed"):
+            skip_label = f"level_{sec['status']}" + (f": {sec['reason']}" if sec.get("reason") else "")
+            api_block = (level_api_totals or {}).get(level) or _not_checked_api_totals_summary(skip_label)
+            total_seen += int(api_block["entity_windows_seen"])
+            total_checked += int(api_block["checked_entity_windows"])
+            total_not_checked += int(api_block["not_checked_entity_windows"])
+            total_mismatched += int(api_block["mismatched_entity_windows"])
+            all_api_mismatches.extend(api_block["mismatches"])
+
             level_reconciliations[level] = {
                 "daily_to_period_matches": None,
                 "discrepancies": [],
+                "api_totals": api_block,
             }
             if level != "campaigns":
                 level_reconciliations[level]["vs_campaigns"] = {
                     "comparable": False,
-                    "comparison_skipped_reason": f"level_{sec['status']}"
-                    + (f": {sec['reason']}" if sec.get("reason") else ""),
+                    "comparison_skipped_reason": skip_label,
                     "matches_campaigns": None,
                     "deltas": None,
                     "explanation": sec["notes"][0] if sec["notes"] else None,
@@ -1066,9 +1492,17 @@ def _reconcile_levels(levels_payload: dict[str, dict[str, Any]]) -> dict[str, An
         if not matches:
             all_daily_match = False
 
+        api_block = (level_api_totals or {}).get(level) or _not_checked_api_totals_summary("no_rows")
+        total_seen += int(api_block["entity_windows_seen"])
+        total_checked += int(api_block["checked_entity_windows"])
+        total_not_checked += int(api_block["not_checked_entity_windows"])
+        total_mismatched += int(api_block["mismatched_entity_windows"])
+        all_api_mismatches.extend(api_block["mismatches"])
+
         entry: dict[str, Any] = {
             "daily_to_period_matches": matches,
             "discrepancies": discrepancies,
+            "api_totals": api_block,
         }
 
         if level != "campaigns":
@@ -1169,8 +1603,46 @@ def _reconcile_levels(levels_payload: dict[str, dict[str, Any]]) -> dict[str, An
 
         level_reconciliations[level] = entry
 
+    if total_mismatched > 0:
+        overall_api_status = "mismatched"
+        overall_api_matches: bool | None = False
+        overall_api_reason: str | None = None
+    elif total_checked == 0:
+        overall_api_status = "not_checked"
+        overall_api_matches = None
+        if total_seen == 0:
+            overall_api_reason = "no_rows"
+        else:
+            lvl_reasons = {
+                str(level_reconciliations[lv]["api_totals"]["not_checked_reason"])
+                for lv in LEVEL_ORDER
+                if level_reconciliations[lv]["api_totals"].get("entity_windows_seen", 0) > 0
+                and level_reconciliations[lv]["api_totals"].get("not_checked_reason")
+            }
+            overall_api_reason = next(iter(lvl_reasons)) if len(lvl_reasons) == 1 else "non_comparable_api_totals"
+    elif total_not_checked > 0:
+        overall_api_status = "partially_checked"
+        overall_api_matches = None
+        overall_api_reason = "partial_api_totals_coverage"
+    else:
+        overall_api_status = "matched"
+        overall_api_matches = True
+        overall_api_reason = None
+
     return {
         "daily_to_period_matches": all_daily_match,
+        "api_totals": {
+            "status": overall_api_status,
+            "matches": overall_api_matches,
+            "not_checked_reason": overall_api_reason,
+            "additive_fields": [*ADDITIVE_INT_FIELDS, "local_spend"],
+            "spend_comparison": dict(SPEND_COMPARISON_SPEC),
+            "entity_windows_seen": total_seen,
+            "checked_entity_windows": total_checked,
+            "not_checked_entity_windows": total_not_checked,
+            "mismatched_entity_windows": total_mismatched,
+            "mismatches": all_api_mismatches,
+        },
         "levels": level_reconciliations,
     }
 
@@ -1393,6 +1865,7 @@ def collect_app_report_export(
     all_errors: list[dict[str, Any]] = []
     detected_currency = scope.currency
     levels_payload: dict[str, dict[str, Any]] = {}
+    level_api_totals: dict[str, dict[str, Any]] = {}
 
     st_min_date = ref_today - timedelta(days=SEARCH_TERM_LOOKBACK)
 
@@ -1469,6 +1942,7 @@ def collect_app_report_export(
         pagination_records: list[PaginationRecord] = []
         raw_observations: list[dict[str, Any]] = []
         seen_daily_keys: set[tuple[Any, ...]] = set()
+        window_buckets: dict[tuple[tuple[Any, ...], date, date], _EntityWindowBucket] = {}
 
         if level == "campaigns":
             campaign_filter = [
@@ -1532,12 +2006,78 @@ def collect_app_report_export(
                         all_errors.append(meta_err)
                     continue
 
-                granular: list[AppsMetrics] = list(getattr(api_row, "granular_metrics", None) or [])
+                ent_key = _entity_key(level, meta_dict)
+                entity_info = _entity_dict(level, meta_dict)
+                entity_label = _format_entity_label(entity_info)
+
+                raw_granular = getattr(api_row, "granular_metrics", None)
+                granular: list[AppsMetrics | None] = list(raw_granular) if raw_granular else []
                 total_m: AppsMetrics | None = getattr(api_row, "total_metrics", None)
+
+                if not granular and total_m is None:
+                    missing_err = _error_dict(
+                        scope="row_validation",
+                        level=level,
+                        campaign_id=meta_dict.get("campaign_id"),
+                        window_start=win_start,
+                        window_end=win_end,
+                        entity=entity_info,
+                        error_type="MissingMetricsError",
+                        message=(
+                            f"{level} report row for {entity_label} in window "
+                            f"{win_start.isoformat()}..{win_end.isoformat()} "
+                            "contained neither granularMetrics nor totalMetrics."
+                        ),
+                    )
+                    level_errors.append(missing_err)
+                    all_errors.append(missing_err)
+                    continue
+
+                bucket_key = (ent_key, win_start, win_end)
+                bucket = window_buckets.get(bucket_key)
+                if bucket is None:
+                    bucket = _EntityWindowBucket(
+                        level=level,
+                        entity_key=ent_key,
+                        entity_info=entity_info,
+                        campaign_id=meta_dict.get("campaign_id"),
+                        window_start=win_start,
+                        window_end=win_end,
+                        timezone=effective_tz.value,
+                    )
+                    window_buckets[bucket_key] = bucket
+
+                if total_m is not None:
+                    total_curr = _explicit_metrics_currency(total_m)
+                    if detected_currency is None and total_curr:
+                        detected_currency = total_curr
+                    if bucket.total_metrics is None:
+                        bucket.total_metrics = total_m
+                        bucket.total_explicit_currency = total_curr
+                    elif not _total_metrics_equivalent(bucket.total_metrics, total_m):
+                        bucket.conflicting_total_metrics = True
 
                 metric_entries: list[tuple[date, AppsMetrics]] = []
                 if granular:
                     for g_entry in granular:
+                        if g_entry is None:
+                            g_err = _error_dict(
+                                scope="row_validation",
+                                level=level,
+                                campaign_id=meta_dict.get("campaign_id"),
+                                window_start=win_start,
+                                window_end=win_end,
+                                entity=entity_info,
+                                error_type="MissingMetricsError",
+                                message=(
+                                    f"{level} granularMetrics contained a null entry for {entity_label} "
+                                    f"in window {win_start.isoformat()}..{win_end.isoformat()}."
+                                ),
+                            )
+                            level_errors.append(g_err)
+                            all_errors.append(g_err)
+                            bucket.had_row_error = True
+                            continue
                         if g_entry.date is None:
                             g_err = _error_dict(
                                 scope="row_validation",
@@ -1545,11 +2085,36 @@ def collect_app_report_export(
                                 campaign_id=meta_dict.get("campaign_id"),
                                 window_start=win_start,
                                 window_end=win_end,
+                                entity=entity_info,
                                 error_type="MissingGranularDateError",
-                                message=f"{level} granularMetrics entry omitted date.",
+                                message=(
+                                    f"{level} granularMetrics entry omitted date for {entity_label} "
+                                    f"in window {win_start.isoformat()}..{win_end.isoformat()}."
+                                ),
                             )
                             level_errors.append(g_err)
                             all_errors.append(g_err)
+                            bucket.had_row_error = True
+                            continue
+                        if g_entry.date < win_start or g_entry.date > win_end:
+                            g_err = _error_dict(
+                                scope="row_validation",
+                                level=level,
+                                campaign_id=meta_dict.get("campaign_id"),
+                                window_start=win_start,
+                                window_end=win_end,
+                                entity=entity_info,
+                                observed_date=g_entry.date,
+                                error_type="OutOfWindowDateError",
+                                message=(
+                                    f"{level} report returned observation date {g_entry.date.isoformat()} "
+                                    f"for {entity_label} outside fetch window "
+                                    f"{win_start.isoformat()}..{win_end.isoformat()}."
+                                ),
+                            )
+                            level_errors.append(g_err)
+                            all_errors.append(g_err)
+                            bucket.had_row_error = True
                             continue
                         metric_entries.append((g_entry.date, g_entry))
                 elif total_m is not None:
@@ -1561,15 +2126,39 @@ def collect_app_report_export(
                             campaign_id=meta_dict.get("campaign_id"),
                             window_start=win_start,
                             window_end=win_end,
+                            entity=entity_info,
                             error_type="MissingGranularMetricsError",
                             message=(
                                 f"{level} report returned totalMetrics without daily granularMetrics "
-                                f"for multi-day window {win_start.isoformat()}..{win_end.isoformat()}."
+                                f"for {entity_label} in multi-day window "
+                                f"{win_start.isoformat()}..{win_end.isoformat()}."
                             ),
                         )
                         level_errors.append(g_err)
                         all_errors.append(g_err)
+                        bucket.had_row_error = True
                         continue
+                    if fallback_date < win_start or fallback_date > win_end:
+                        g_err = _error_dict(
+                            scope="row_validation",
+                            level=level,
+                            campaign_id=meta_dict.get("campaign_id"),
+                            window_start=win_start,
+                            window_end=win_end,
+                            entity=entity_info,
+                            observed_date=fallback_date,
+                            error_type="OutOfWindowDateError",
+                            message=(
+                                f"{level} report returned totalMetrics fallback date {fallback_date.isoformat()} "
+                                f"for {entity_label} outside fetch window "
+                                f"{win_start.isoformat()}..{win_end.isoformat()}."
+                            ),
+                        )
+                        level_errors.append(g_err)
+                        all_errors.append(g_err)
+                        bucket.had_row_error = True
+                        continue
+                    bucket.used_total_fallback = True
                     metric_entries.append((fallback_date, total_m))
 
                 for obs_date, m_entry in metric_entries:
@@ -1593,14 +2182,32 @@ def collect_app_report_export(
                             campaign_id=meta_dict.get("campaign_id"),
                             window_start=win_start,
                             window_end=win_end,
+                            entity=entity_info,
+                            observed_date=obs_date,
                             error_type="DuplicateDailyRowError",
                             message=f"Duplicate daily observation for key {daily_key} in {level}.",
                         )
                         level_errors.append(dup_err)
                         all_errors.append(dup_err)
+                        bucket.had_row_error = True
                         continue
                     seen_daily_keys.add(daily_key)
                     raw_observations.append(obs_row)
+                    bucket.daily_rows.append(obs_row)
+                    bucket.daily_raw_spends.append(
+                        _parse_decimal(m_entry.local_spend.amount) if m_entry.local_spend is not None else None
+                    )
+                    explicit_curr = _explicit_metrics_currency(m_entry)
+                    if explicit_curr is not None:
+                        bucket.daily_explicit_currencies.add(explicit_curr)
+
+        level_api_totals[level] = _evaluate_level_api_totals(
+            level,
+            window_buckets,
+            default_currency=detected_currency,
+            level_errors=level_errors,
+            all_errors=all_errors,
+        )
 
         # Update catalog_names with any campaign names learned from the campaigns report
         if level == "campaigns":
@@ -1677,7 +2284,7 @@ def collect_app_report_export(
             if lv_sec["currency"] is None:
                 lv_sec["currency"] = detected_currency
 
-    reconciliation = _reconcile_levels(levels_payload)
+    reconciliation = _reconcile_levels(levels_payload, level_api_totals=level_api_totals)
     if not reconciliation["daily_to_period_matches"]:
         rec_err = _error_dict(
             scope="reconciliation",

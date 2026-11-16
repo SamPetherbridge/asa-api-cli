@@ -29,7 +29,7 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    "asa-api-client>=0.6.1",
+    "asa-api-client>=1.0.1",
     "typer>=0.13.0",
     "rich>=13.9.0",
     "pydantic-ai>=0.1.0",
@@ -41,9 +41,12 @@ asa = "asa_api_cli:app"
 
 [project.optional-dependencies]
 analyze = [
-    "asa-api-client[cli]>=0.6.1",
+    "asa-api-client[cli]>=1.0.1",
 ]
 dev = [
+    "asa-api-client[cli]>=1.0.1",
+    "hatchling>=1.25.0",
+    "packaging>=24.0",
     "pytest>=8.3.0",
     "pytest-asyncio>=0.24.0",
     "pytest-cov>=6.0.0",

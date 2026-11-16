@@ -869,26 +869,31 @@ def test_timezone_utc_prevents_mixing_ortz_search_terms_and_lookback_unavailable
         result=[_campaign(101, "Alpha", APP_A_ID)],
         pagination=V1Pagination(offset=0, pageSize=500, totalCount=1),
     )
-    client.reports.campaigns.return_value = AppsCampaignReportResponse(
-        result=AppsCampaignResultContainer(
-            rows=[
-                AppsCampaignReportRow(
-                    metadata=AppsReportingCampaign(id=101, name="Alpha"),
-                    granularMetrics=[
-                        _campaign_metrics(
-                            date(2026, 1, 10),
-                            impressions=100,
-                            taps=10,
-                            spend="12.00",
-                            tap_installs=2,
-                            total_installs=2,
-                        )
-                    ],
-                )
-            ]
-        ),
-        pagination=V1Pagination(offset=0, pageSize=5000, totalCount=1),
-    )
+
+    def campaigns_for_window(req: AppsReportingRequest) -> AppsCampaignReportResponse:
+        assert req.time_range is not None and req.time_range.start is not None
+        return AppsCampaignReportResponse(
+            result=AppsCampaignResultContainer(
+                rows=[
+                    AppsCampaignReportRow(
+                        metadata=AppsReportingCampaign(id=101, name="Alpha"),
+                        granularMetrics=[
+                            _campaign_metrics(
+                                req.time_range.start,
+                                impressions=100,
+                                taps=10,
+                                spend="12.00",
+                                tap_installs=2,
+                                total_installs=2,
+                            )
+                        ],
+                    )
+                ]
+            ),
+            pagination=V1Pagination(offset=0, pageSize=5000, totalCount=1),
+        )
+
+    client.reports.campaigns.side_effect = campaigns_for_window
     client.reports.ad_groups.return_value = AppsAdGroupReportResponse(
         result=AppsAdGroupResultContainer(rows=[]),
         pagination=V1Pagination(offset=0, pageSize=5000, totalCount=0),
@@ -1329,3 +1334,748 @@ def test_reporting_path_invokes_only_read_only_http_endpoints(
         if method == "POST":
             assert path.endswith("/query") or path == "/v1/search/apps"
         assert headers.get("x-ap-context") == "adAccountId=123456"
+
+
+def _set_empty_subordinate_reports(client: MagicMock) -> None:
+    """Configure ad_groups, ads, keywords, and search_terms to return genuinely empty responses."""
+    client.reports.ad_groups.return_value = AppsAdGroupReportResponse(
+        result=AppsAdGroupResultContainer(rows=[]),
+        pagination=V1Pagination(offset=0, pageSize=5000, totalCount=0),
+    )
+    client.reports.ads.return_value = AppsAdReportResponse(
+        result=AppsAdResultContainer(rows=[]),
+        pagination=V1Pagination(offset=0, pageSize=5000, totalCount=0),
+    )
+    client.reports.keywords.return_value = AppsKeywordReportResponse(
+        result=AppsKeywordResultContainer(rows=[]),
+        pagination=V1Pagination(offset=0, pageSize=5000, totalCount=0),
+    )
+    client.reports.search_terms.return_value = AppsSearchTermReportResponse(
+        result=AppsSearchTermResultContainer(rows=[]),
+        pagination=V1Pagination(offset=0, pageSize=5000, totalCount=0),
+    )
+
+
+def test_out_of_window_dates_rejected_across_granular_boundaries_chunks_and_fallbacks(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Issue #71: Reject observation dates outside the effective fetch window and keep valid boundary rows."""
+    out_file = tmp_path / "out_of_window.json"
+
+    # 1. Exact CLI reproduction: 2026-10-01 returned for 2026-11-01..2026-11-07
+    repro_client = _mock_client("123456")
+    repro_client.campaigns.query.return_value = V1Page[Campaign](
+        result=[_campaign(101, "Alpha", APP_A_ID)],
+        pagination=V1Pagination(offset=0, pageSize=500, totalCount=1),
+    )
+    repro_client.reports.campaigns.return_value = AppsCampaignReportResponse(
+        result=AppsCampaignResultContainer(
+            rows=[
+                AppsCampaignReportRow(
+                    metadata=AppsReportingCampaign(id=101, name="Alpha"),
+                    granularMetrics=[
+                        _campaign_metrics(
+                            date(2026, 10, 1),
+                            impressions=100,
+                            taps=10,
+                            spend="10.00",
+                            tap_installs=2,
+                            total_installs=2,
+                        )
+                    ],
+                )
+            ]
+        ),
+        pagination=V1Pagination(offset=0, pageSize=5000, totalCount=1),
+    )
+    _set_empty_subordinate_reports(repro_client)
+    monkeypatch.setattr(reports, "get_client", lambda: repro_client)
+
+    res = runner.invoke(
+        main_mod.app,
+        [
+            "reports",
+            "export",
+            "--app",
+            str(APP_A_ID),
+            "--start",
+            "2026-11-01",
+            "--end",
+            "2026-11-07",
+            "-o",
+            str(out_file),
+        ],
+    )
+    assert res.exit_code == utils.EXIT_ERROR
+    repro_doc = json.loads(out_file.read_text(encoding="utf-8"))
+    assert repro_doc["complete"] is False
+    assert repro_doc["status"] == "partial"
+    assert repro_doc["levels"]["campaigns"]["complete"] is False
+    assert repro_doc["levels"]["campaigns"]["daily"] == []
+    assert len(repro_doc["errors"]) == 1
+    err = repro_doc["errors"][0]
+    assert err["error_type"] == "OutOfWindowDateError"
+    assert err["level"] == "campaigns"
+    assert err["campaign_id"] == 101
+    assert err["entity"]["campaign_id"] == 101
+    assert err["observed_date"] == "2026-10-01"
+    assert err["window_start"] == "2026-11-01"
+    assert err["window_end"] == "2026-11-07"
+
+    # 2. Before window (2026-10-31), after window (2026-11-08), and both inclusive boundaries (11-01, 11-07)
+    boundary_client = _mock_client("123456")
+    boundary_client.campaigns.query.return_value = V1Page[Campaign](
+        result=[_campaign(101, "Alpha", APP_A_ID)],
+        pagination=V1Pagination(offset=0, pageSize=500, totalCount=1),
+    )
+    boundary_client.reports.campaigns.return_value = AppsCampaignReportResponse(
+        result=AppsCampaignResultContainer(
+            rows=[
+                AppsCampaignReportRow(
+                    metadata=AppsReportingCampaign(id=101, name="Alpha"),
+                    granularMetrics=[
+                        _campaign_metrics(date(2026, 10, 31), impressions=50, taps=5, spend="5.00"),
+                        _campaign_metrics(date(2026, 11, 1), impressions=100, taps=10, spend="10.00"),
+                        _campaign_metrics(date(2026, 11, 7), impressions=200, taps=20, spend="20.00"),
+                        _campaign_metrics(date(2026, 11, 8), impressions=60, taps=6, spend="6.00"),
+                    ],
+                )
+            ]
+        ),
+        pagination=V1Pagination(offset=0, pageSize=5000, totalCount=1),
+    )
+    _set_empty_subordinate_reports(boundary_client)
+
+    boundary_doc = collect_app_report_export(
+        boundary_client,
+        adam_id=APP_A_ID,
+        start_date=date(2026, 11, 1),
+        end_date=date(2026, 11, 7),
+        today=FIXED_TODAY,
+        collected_at=FIXED_NOW,
+    )
+    assert boundary_doc["complete"] is False
+    assert boundary_doc["status"] == "partial"
+    assert [r["date"] for r in boundary_doc["levels"]["campaigns"]["daily"]] == ["2026-11-01", "2026-11-07"]
+    assert boundary_doc["levels"]["campaigns"]["period_totals"][0]["local_spend"] == "30.00"
+    assert [e["observed_date"] for e in boundary_doc["errors"]] == ["2026-10-31", "2026-11-08"]
+
+    # Valid-only inclusive boundaries succeed with complete=True
+    valid_boundary_client = _mock_client("123456")
+    valid_boundary_client.campaigns.query.return_value = V1Page[Campaign](
+        result=[_campaign(101, "Alpha", APP_A_ID)],
+        pagination=V1Pagination(offset=0, pageSize=500, totalCount=1),
+    )
+    valid_boundary_client.reports.campaigns.return_value = AppsCampaignReportResponse(
+        result=AppsCampaignResultContainer(
+            rows=[
+                AppsCampaignReportRow(
+                    metadata=AppsReportingCampaign(id=101, name="Alpha"),
+                    granularMetrics=[
+                        _campaign_metrics(date(2026, 11, 1), impressions=100, taps=10, spend="10.00"),
+                        _campaign_metrics(date(2026, 11, 7), impressions=200, taps=20, spend="20.00"),
+                    ],
+                )
+            ]
+        ),
+        pagination=V1Pagination(offset=0, pageSize=5000, totalCount=1),
+    )
+    _set_empty_subordinate_reports(valid_boundary_client)
+    valid_boundary_doc = collect_app_report_export(
+        valid_boundary_client,
+        adam_id=APP_A_ID,
+        start_date=date(2026, 11, 1),
+        end_date=date(2026, 11, 7),
+        today=FIXED_TODAY,
+        collected_at=FIXED_NOW,
+    )
+    assert valid_boundary_doc["complete"] is True
+    assert [r["date"] for r in valid_boundary_doc["levels"]["campaigns"]["daily"]] == ["2026-11-01", "2026-11-07"]
+
+    # 3. Chunked >90d request AND lookback-clipped search_terms validate per-fetch-window bounds
+    chunk_client = _mock_client("123456")
+    chunk_client.campaigns.query.return_value = V1Page[Campaign](
+        result=[_campaign(101, "Alpha", APP_A_ID)],
+        pagination=V1Pagination(offset=0, pageSize=500, totalCount=1),
+    )
+
+    def chunk_campaigns(req: AppsReportingRequest) -> AppsCampaignReportResponse:
+        assert req.time_range is not None
+        if req.time_range.start == date(2026, 8, 1):
+            # Window 1 is 2026-08-01..2026-10-29; 2026-10-30 is inside overall period but outside Window 1!
+            rows = [
+                AppsCampaignReportRow(
+                    metadata=AppsReportingCampaign(id=101, name="Alpha"),
+                    granularMetrics=[_campaign_metrics(date(2026, 10, 30), impressions=50, taps=5, spend="5.00")],
+                )
+            ]
+        else:
+            rows = []
+        return AppsCampaignReportResponse(
+            result=AppsCampaignResultContainer(rows=rows),
+            pagination=V1Pagination(offset=0, pageSize=5000, totalCount=len(rows)),
+        )
+
+    def clipped_search_terms(req: AppsReportingRequest) -> AppsSearchTermReportResponse:
+        assert req.time_range is not None
+        # Search terms lookback clips 2026-08-01..2026-11-08 to 2026-08-18..2026-11-08; 2026-08-17 is out of window!
+        return AppsSearchTermReportResponse(
+            result=AppsSearchTermResultContainer(
+                rows=[
+                    AppsSearchTermReportRow(
+                        metadata=ReportingSearchTerm(
+                            campaignId=101,
+                            adGroupId=1010,
+                            searchTermText="alpha",
+                            searchTermSource="TARGETED",
+                        ),
+                        granularMetrics=[_metrics(date(2026, 8, 17), impressions=10, taps=1, spend="1.00")],
+                    )
+                ]
+            ),
+            pagination=V1Pagination(offset=0, pageSize=5000, totalCount=1),
+        )
+
+    _set_empty_subordinate_reports(chunk_client)
+    chunk_client.reports.campaigns.side_effect = chunk_campaigns
+    chunk_client.reports.search_terms.side_effect = clipped_search_terms
+
+    chunk_doc = collect_app_report_export(
+        chunk_client,
+        adam_id=APP_A_ID,
+        start_date=date(2026, 8, 1),
+        end_date=date(2026, 11, 8),
+        today=FIXED_TODAY,
+        collected_at=FIXED_NOW,
+    )
+    assert chunk_doc["complete"] is False
+    assert chunk_doc["levels"]["campaigns"]["daily"] == []
+    assert chunk_doc["levels"]["search_terms"]["daily"] == []
+    assert {(e["level"], e["observed_date"], e["window_start"], e["window_end"]) for e in chunk_doc["errors"]} == {
+        ("campaigns", "2026-10-30", "2026-08-01", "2026-10-29"),
+        ("search_terms", "2026-08-17", "2026-08-18", "2026-11-08"),
+    }
+
+    # 4. Dated total_metrics fallback outside window is rejected (both multi-day and single-day windows)
+    fallback_client = _mock_client("123456")
+    fallback_client.campaigns.query.return_value = V1Page[Campaign](
+        result=[_campaign(101, "Alpha", APP_A_ID)],
+        pagination=V1Pagination(offset=0, pageSize=500, totalCount=1),
+    )
+    fallback_client.reports.campaigns.return_value = AppsCampaignReportResponse(
+        result=AppsCampaignResultContainer(
+            rows=[
+                AppsCampaignReportRow(
+                    metadata=AppsReportingCampaign(id=101, name="Alpha"),
+                    totalMetrics=_campaign_metrics(date(2026, 11, 2), impressions=50, taps=5, spend="5.00"),
+                )
+            ]
+        ),
+        pagination=V1Pagination(offset=0, pageSize=5000, totalCount=1),
+    )
+    _set_empty_subordinate_reports(fallback_client)
+
+    fallback_doc = collect_app_report_export(
+        fallback_client,
+        adam_id=APP_A_ID,
+        start_date=date(2026, 11, 1),
+        end_date=date(2026, 11, 1),
+        today=FIXED_TODAY,
+        collected_at=FIXED_NOW,
+    )
+    assert fallback_doc["complete"] is False
+    assert fallback_doc["levels"]["campaigns"]["daily"] == []
+    assert fallback_doc["errors"][0]["error_type"] == "OutOfWindowDateError"
+    assert fallback_doc["errors"][0]["observed_date"] == "2026-11-02"
+
+
+def test_metric_less_api_rows_reported_as_incomplete_while_empty_rows_succeed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Issue #72: Identified rows lacking both granular and total metrics fail, while zero-row responses succeed."""
+    out_file = tmp_path / "metric_less.json"
+
+    # 1. Exact CLI reproduction: 1 campaign row with neither granularMetrics nor totalMetrics (totalCount=1)
+    metricless_client = _mock_client("123456")
+    metricless_client.campaigns.query.return_value = V1Page[Campaign](
+        result=[_campaign(101, "Alpha", APP_A_ID)],
+        pagination=V1Pagination(offset=0, pageSize=500, totalCount=1),
+    )
+    metricless_client.reports.campaigns.return_value = AppsCampaignReportResponse(
+        result=AppsCampaignResultContainer(
+            rows=[AppsCampaignReportRow(metadata=AppsReportingCampaign(id=101, name="Alpha"))]
+        ),
+        pagination=V1Pagination(offset=0, pageSize=5000, totalCount=1),
+    )
+    _set_empty_subordinate_reports(metricless_client)
+    monkeypatch.setattr(reports, "get_client", lambda: metricless_client)
+
+    res = runner.invoke(
+        main_mod.app,
+        [
+            "reports",
+            "export",
+            "--app",
+            str(APP_A_ID),
+            "--start",
+            "2026-11-01",
+            "--end",
+            "2026-11-07",
+            "-o",
+            str(out_file),
+        ],
+    )
+    assert res.exit_code == utils.EXIT_ERROR
+    doc = json.loads(out_file.read_text(encoding="utf-8"))
+    assert doc["complete"] is False
+    assert doc["status"] == "partial"
+    assert doc["empty_reason"] is None
+    assert doc["levels"]["campaigns"]["pagination"]["api_rows_fetched"] == 1
+    assert doc["levels"]["campaigns"]["complete"] is False
+    assert len(doc["errors"]) == 1
+    assert doc["errors"][0]["error_type"] == "MissingMetricsError"
+    assert doc["errors"][0]["level"] == "campaigns"
+    assert doc["errors"][0]["entity"]["campaign_id"] == 101
+    assert doc["errors"][0]["window_start"] == "2026-11-01"
+    assert doc["errors"][0]["window_end"] == "2026-11-07"
+
+    # 2. Mixed valid zero-valued / nullable-field row + malformed empty-granular row
+    mixed_client = _mock_client("123456")
+    mixed_client.campaigns.query.return_value = V1Page[Campaign](
+        result=[
+            _campaign(101, "Alpha Zero", APP_A_ID),
+            _campaign(102, "Alpha Malformed", APP_A_ID),
+        ],
+        pagination=V1Pagination(offset=0, pageSize=500, totalCount=2),
+    )
+    mixed_client.reports.campaigns.return_value = AppsCampaignReportResponse(
+        result=AppsCampaignResultContainer(
+            rows=[
+                AppsCampaignReportRow(
+                    metadata=AppsReportingCampaign(id=101, name="Alpha Zero"),
+                    granularMetrics=[
+                        AppsCampaignMetrics(
+                            date=date(2026, 11, 1),
+                            impressions=0,
+                            taps=0,
+                            localSpend=Money(amount="0.00", currency="AUD"),
+                            tapInstalls=0,
+                            viewInstalls=None,
+                            totalInstalls=None,
+                        )
+                    ],
+                ),
+                AppsCampaignReportRow(
+                    metadata=AppsReportingCampaign(id=102, name="Alpha Malformed"),
+                    granularMetrics=[],
+                    totalMetrics=None,
+                ),
+            ]
+        ),
+        pagination=V1Pagination(offset=0, pageSize=5000, totalCount=2),
+    )
+    _set_empty_subordinate_reports(mixed_client)
+
+    mixed_doc = collect_app_report_export(
+        mixed_client,
+        adam_id=APP_A_ID,
+        start_date=date(2026, 11, 1),
+        end_date=date(2026, 11, 7),
+        today=FIXED_TODAY,
+        collected_at=FIXED_NOW,
+    )
+    assert mixed_doc["complete"] is False
+    assert mixed_doc["status"] == "partial"
+    assert len(mixed_doc["levels"]["campaigns"]["daily"]) == 1
+    kept_row = mixed_doc["levels"]["campaigns"]["daily"][0]
+    assert kept_row["campaign_id"] == 101
+    assert kept_row["impressions"] == 0
+    assert kept_row["taps"] == 0
+    assert kept_row["local_spend"] == "0.00"
+    assert kept_row["tap_installs"] == 0
+    # Missing nullable fields remain None, never fabricated into 0
+    assert kept_row["view_installs"] is None
+    assert kept_row["total_installs"] is None
+    assert kept_row["tap_pre_orders_placed"] is None
+    assert len(mixed_doc["errors"]) == 1
+    assert mixed_doc["errors"][0]["error_type"] == "MissingMetricsError"
+    assert mixed_doc["errors"][0]["entity"]["campaign_id"] == 102
+
+
+def test_reconcile_daily_metrics_against_independent_api_totals(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Issue #73: Reconcile daily observations against independent API totalMetrics per entity and window."""
+    out_file = tmp_path / "api_totals.json"
+
+    # 1. Exact CLI reproduction: daily spend=10 vs API totalMetrics spend=100 -> incomplete + exit 1
+    mismatch_client = _mock_client("123456")
+    mismatch_client.campaigns.query.return_value = V1Page[Campaign](
+        result=[_campaign(101, "Alpha", APP_A_ID)],
+        pagination=V1Pagination(offset=0, pageSize=500, totalCount=1),
+    )
+    mismatch_client.reports.campaigns.return_value = AppsCampaignReportResponse(
+        result=AppsCampaignResultContainer(
+            rows=[
+                AppsCampaignReportRow(
+                    metadata=AppsReportingCampaign(id=101, name="Alpha"),
+                    granularMetrics=[
+                        _campaign_metrics(
+                            date(2026, 11, 1),
+                            impressions=100,
+                            taps=10,
+                            spend="10.00",
+                            tap_installs=2,
+                            total_installs=3,
+                        )
+                    ],
+                    totalMetrics=_campaign_metrics(
+                        date(2026, 11, 1),
+                        impressions=1000,
+                        taps=100,
+                        spend="100.00",
+                        tap_installs=20,
+                        total_installs=30,
+                    ),
+                )
+            ]
+        ),
+        pagination=V1Pagination(offset=0, pageSize=5000, totalCount=1),
+    )
+    _set_empty_subordinate_reports(mismatch_client)
+    monkeypatch.setattr(reports, "get_client", lambda: mismatch_client)
+
+    res = runner.invoke(
+        main_mod.app,
+        [
+            "reports",
+            "export",
+            "--app",
+            str(APP_A_ID),
+            "--start",
+            "2026-11-01",
+            "--end",
+            "2026-11-07",
+            "-o",
+            str(out_file),
+        ],
+    )
+    assert res.exit_code == utils.EXIT_ERROR
+    mismatch_doc = json.loads(out_file.read_text(encoding="utf-8"))
+    assert mismatch_doc["complete"] is False
+    assert mismatch_doc["status"] == "partial"
+    # Internal aggregation check remains distinct from independent API-total reconciliation
+    assert mismatch_doc["reconciliation"]["daily_to_period_matches"] is True
+    api_rec = mismatch_doc["reconciliation"]["api_totals"]
+    assert api_rec["status"] == "mismatched"
+    assert api_rec["matches"] is False
+    assert api_rec["checked_entity_windows"] == 1
+    assert api_rec["mismatched_entity_windows"] == 1
+    by_field = {m["field"]: m for m in api_rec["mismatches"][0]["field_mismatches"]}
+    assert by_field["local_spend"] == {
+        "field": "local_spend",
+        "expected": "100.00",
+        "observed": "10.00",
+        "delta": "-90.00",
+    }
+    assert by_field["impressions"] == {"field": "impressions", "expected": 1000, "observed": 100, "delta": -900}
+    assert by_field["taps"] == {"field": "taps", "expected": 100, "observed": 10, "delta": -90}
+    assert by_field["tap_installs"] == {"field": "tap_installs", "expected": 20, "observed": 2, "delta": -18}
+    assert by_field["total_installs"] == {"field": "total_installs", "expected": 30, "observed": 3, "delta": -27}
+    assert mismatch_doc["errors"][0]["error_type"] == "ApiTotalMismatchError"
+
+    # 2. Matching decimal spend ("0.10" + "0.20" == "0.30" and 4-decimal precision), nullable fields, & skipped fields
+    match_client = _mock_client("123456")
+    match_client.campaigns.query.return_value = V1Page[Campaign](
+        result=[_campaign(101, "Alpha", APP_A_ID)],
+        pagination=V1Pagination(offset=0, pageSize=500, totalCount=1),
+    )
+    match_client.reports.campaigns.return_value = AppsCampaignReportResponse(
+        result=AppsCampaignResultContainer(
+            rows=[
+                AppsCampaignReportRow(
+                    metadata=AppsReportingCampaign(id=101, name="Alpha"),
+                    granularMetrics=[
+                        _campaign_metrics(
+                            date(2026, 11, 1),
+                            impressions=100,
+                            taps=10,
+                            spend="0.1025",
+                            tap_installs=1,
+                            view_installs=2,
+                            total_installs=3,
+                        ),
+                        _campaign_metrics(
+                            date(2026, 11, 2),
+                            impressions=200,
+                            taps=20,
+                            spend="0.1975",
+                            tap_installs=2,
+                            view_installs=None,  # Nullable on day 2 -> daily sum is None, skipped (not 0!)
+                            total_installs=4,
+                        ),
+                    ],
+                    totalMetrics=AppsCampaignMetrics(
+                        impressions=300,
+                        taps=30,
+                        localSpend=Money(amount="0.30", currency="AUD"),
+                        tapInstalls=3,
+                        viewInstalls=5,
+                        totalInstalls=7,
+                        # Ratios on totalMetrics are NOT summed; different rounded ttr does not cause false mismatch
+                        ttr=0.1,
+                    ),
+                )
+            ]
+        ),
+        pagination=V1Pagination(offset=0, pageSize=5000, totalCount=1),
+    )
+    _set_empty_subordinate_reports(match_client)
+
+    match_doc = collect_app_report_export(
+        match_client,
+        adam_id=APP_A_ID,
+        start_date=date(2026, 11, 1),
+        end_date=date(2026, 11, 2),
+        today=FIXED_TODAY,
+        collected_at=FIXED_NOW,
+    )
+    assert match_doc["complete"] is True
+    assert match_doc["status"] == "complete"
+    assert match_doc["reconciliation"]["api_totals"]["status"] == "matched"
+    assert match_doc["reconciliation"]["api_totals"]["matches"] is True
+    camp_check = match_doc["reconciliation"]["levels"]["campaigns"]["api_totals"]["checks"][0]
+    assert camp_check["status"] == "matched"
+    assert "local_spend" in camp_check["compared_fields"]
+    assert "view_installs" in camp_check["skipped_fields"]
+    assert camp_check["skipped_field_reasons"]["view_installs"] == "daily_null"
+    assert camp_check["skipped_field_reasons"]["tap_pre_orders_placed"] == "both_null"
+    assert camp_check["skipped_field_reasons"]["tap_new_downloads"] == "api_total_null"
+
+    # Sub-cent decimal spend disagreement ("0.3001" vs "0.3000") is caught without float rounding
+    subcent_client = _mock_client("123456")
+    subcent_client.campaigns.query.return_value = V1Page[Campaign](
+        result=[_campaign(101, "Alpha", APP_A_ID)],
+        pagination=V1Pagination(offset=0, pageSize=500, totalCount=1),
+    )
+    subcent_client.reports.campaigns.return_value = AppsCampaignReportResponse(
+        result=AppsCampaignResultContainer(
+            rows=[
+                AppsCampaignReportRow(
+                    metadata=AppsReportingCampaign(id=101, name="Alpha"),
+                    granularMetrics=[_campaign_metrics(date(2026, 11, 1), impressions=10, taps=1, spend="0.3000")],
+                    totalMetrics=AppsCampaignMetrics(
+                        impressions=10,
+                        taps=1,
+                        localSpend=Money(amount="0.3001", currency="AUD"),
+                    ),
+                )
+            ]
+        ),
+        pagination=V1Pagination(offset=0, pageSize=5000, totalCount=1),
+    )
+    _set_empty_subordinate_reports(subcent_client)
+    subcent_doc = collect_app_report_export(
+        subcent_client,
+        adam_id=APP_A_ID,
+        start_date=date(2026, 11, 1),
+        end_date=date(2026, 11, 1),
+        today=FIXED_TODAY,
+        collected_at=FIXED_NOW,
+    )
+    assert subcent_doc["complete"] is False
+    assert subcent_doc["reconciliation"]["api_totals"]["mismatches"][0]["field_mismatches"] == [
+        {"field": "local_spend", "expected": "0.3001", "observed": "0.30", "delta": "-0.0001"}
+    ]
+
+    # 3. Absent totals & single-day totalMetrics fallback report not_checked (matches=None), NEVER matches=True
+    absent_client = _mock_client("123456")
+    absent_client.campaigns.query.return_value = V1Page[Campaign](
+        result=[_campaign(101, "Alpha", APP_A_ID), _campaign(102, "Alpha Fallback", APP_A_ID)],
+        pagination=V1Pagination(offset=0, pageSize=500, totalCount=2),
+    )
+    absent_client.reports.campaigns.return_value = AppsCampaignReportResponse(
+        result=AppsCampaignResultContainer(
+            rows=[
+                AppsCampaignReportRow(
+                    metadata=AppsReportingCampaign(id=101, name="Alpha"),
+                    granularMetrics=[_campaign_metrics(date(2026, 11, 1), impressions=50, taps=5, spend="5.00")],
+                    totalMetrics=None,
+                ),
+                AppsCampaignReportRow(
+                    metadata=AppsReportingCampaign(id=102, name="Alpha Fallback"),
+                    granularMetrics=None,
+                    totalMetrics=_campaign_metrics(date(2026, 11, 1), impressions=40, taps=4, spend="4.00"),
+                ),
+            ]
+        ),
+        pagination=V1Pagination(offset=0, pageSize=5000, totalCount=2),
+    )
+    _set_empty_subordinate_reports(absent_client)
+    absent_doc = collect_app_report_export(
+        absent_client,
+        adam_id=APP_A_ID,
+        start_date=date(2026, 11, 1),
+        end_date=date(2026, 11, 1),
+        today=FIXED_TODAY,
+        collected_at=FIXED_NOW,
+    )
+    assert absent_doc["complete"] is True
+    assert absent_doc["reconciliation"]["api_totals"]["status"] == "not_checked"
+    assert absent_doc["reconciliation"]["api_totals"]["matches"] is None
+    checks_by_cid = {
+        c["entity"]["campaign_id"]: c
+        for c in absent_doc["reconciliation"]["levels"]["campaigns"]["api_totals"]["checks"]
+    }
+    assert checks_by_cid[101]["not_checked_reason"] == "missing_total_metrics"
+    assert checks_by_cid[101]["matches"] is None
+    assert checks_by_cid[102]["not_checked_reason"] == "used_as_daily_fallback"
+    assert checks_by_cid[102]["matches"] is None
+
+    # 4. Multiple windows (>90d chunks): each fetch window checked once without cross-chunk duplication
+    multi_win_client = _mock_client("123456")
+    multi_win_client.campaigns.query.return_value = V1Page[Campaign](
+        result=[_campaign(101, "Alpha", APP_A_ID)],
+        pagination=V1Pagination(offset=0, pageSize=500, totalCount=1),
+    )
+
+    def multi_win_campaigns_match(req: AppsReportingRequest) -> AppsCampaignReportResponse:
+        assert req.time_range is not None
+        if req.time_range.start == date(2026, 8, 1):
+            row = AppsCampaignReportRow(
+                metadata=AppsReportingCampaign(id=101, name="Alpha"),
+                granularMetrics=[
+                    _campaign_metrics(date(2026, 8, 15), impressions=100, taps=10, spend="12.50"),
+                    _campaign_metrics(date(2026, 9, 15), impressions=150, taps=15, spend="17.50"),
+                ],
+                totalMetrics=AppsCampaignMetrics(
+                    impressions=250,
+                    taps=25,
+                    localSpend=Money(amount="30.00", currency="AUD"),
+                ),
+            )
+        else:
+            row = AppsCampaignReportRow(
+                metadata=AppsReportingCampaign(id=101, name="Alpha"),
+                granularMetrics=[
+                    _campaign_metrics(date(2026, 11, 2), impressions=80, taps=8, spend="9.25"),
+                ],
+                totalMetrics=AppsCampaignMetrics(
+                    impressions=80,
+                    taps=8,
+                    localSpend=Money(amount="9.25", currency="AUD"),
+                ),
+            )
+        return AppsCampaignReportResponse(
+            result=AppsCampaignResultContainer(rows=[row]),
+            pagination=V1Pagination(offset=0, pageSize=5000, totalCount=1),
+        )
+
+    _set_empty_subordinate_reports(multi_win_client)
+    multi_win_client.reports.campaigns.side_effect = multi_win_campaigns_match
+
+    multi_ok = collect_app_report_export(
+        multi_win_client,
+        adam_id=APP_A_ID,
+        start_date=date(2026, 8, 1),
+        end_date=date(2026, 11, 8),
+        today=FIXED_TODAY,
+        collected_at=FIXED_NOW,
+    )
+    assert multi_ok["complete"] is True
+    assert multi_ok["reconciliation"]["api_totals"]["status"] == "matched"
+    assert multi_ok["reconciliation"]["api_totals"]["matches"] is True
+    assert multi_ok["reconciliation"]["api_totals"]["checked_entity_windows"] == 2
+    assert multi_ok["levels"]["campaigns"]["period_totals"][0]["local_spend"] == "39.25"
+
+    # Multi-window where Window 2 disagrees on API totalMetrics is caught with Window 2's exact dates
+    def multi_win_campaigns_mismatch(req: AppsReportingRequest) -> AppsCampaignReportResponse:
+        assert req.time_range is not None
+        if req.time_range.start == date(2026, 8, 1):
+            row = AppsCampaignReportRow(
+                metadata=AppsReportingCampaign(id=101, name="Alpha"),
+                granularMetrics=[_campaign_metrics(date(2026, 8, 15), impressions=100, taps=10, spend="10.00")],
+                totalMetrics=AppsCampaignMetrics(
+                    impressions=100,
+                    taps=10,
+                    localSpend=Money(amount="10.00", currency="AUD"),
+                ),
+            )
+        else:
+            row = AppsCampaignReportRow(
+                metadata=AppsReportingCampaign(id=101, name="Alpha"),
+                granularMetrics=[_campaign_metrics(date(2026, 11, 2), impressions=80, taps=8, spend="9.25")],
+                totalMetrics=AppsCampaignMetrics(
+                    impressions=80,
+                    taps=8,
+                    localSpend=Money(amount="19.25", currency="AUD"),
+                ),
+            )
+        return AppsCampaignReportResponse(
+            result=AppsCampaignResultContainer(rows=[row]),
+            pagination=V1Pagination(offset=0, pageSize=5000, totalCount=1),
+        )
+
+    multi_win_client.reports.campaigns.side_effect = multi_win_campaigns_mismatch
+    multi_bad = collect_app_report_export(
+        multi_win_client,
+        adam_id=APP_A_ID,
+        start_date=date(2026, 8, 1),
+        end_date=date(2026, 11, 8),
+        today=FIXED_TODAY,
+        collected_at=FIXED_NOW,
+    )
+    assert multi_bad["complete"] is False
+    assert multi_bad["reconciliation"]["api_totals"]["status"] == "mismatched"
+    assert multi_bad["reconciliation"]["api_totals"]["matches"] is False
+    assert multi_bad["reconciliation"]["api_totals"]["mismatches"][0]["window_start"] == "2026-10-30"
+    assert multi_bad["reconciliation"]["api_totals"]["mismatches"][0]["window_end"] == "2026-11-08"
+
+    # Non-comparable totalMetrics (currency mismatch and all-null totalMetrics) report not_checked, never matches=True
+    non_comp_client = _mock_client("123456")
+    non_comp_client.campaigns.query.return_value = V1Page[Campaign](
+        result=[_campaign(101, "Alpha", APP_A_ID), _campaign(102, "Alpha Null Total", APP_A_ID)],
+        pagination=V1Pagination(offset=0, pageSize=500, totalCount=2),
+    )
+    non_comp_client.reports.campaigns.return_value = AppsCampaignReportResponse(
+        result=AppsCampaignResultContainer(
+            rows=[
+                AppsCampaignReportRow(
+                    metadata=AppsReportingCampaign(id=101, name="Alpha"),
+                    granularMetrics=[_campaign_metrics(date(2026, 11, 1), impressions=50, taps=5, spend="5.00")],
+                    totalMetrics=AppsCampaignMetrics(
+                        impressions=50,
+                        taps=5,
+                        localSpend=Money(amount="5.00", currency="USD"),
+                    ),
+                ),
+                AppsCampaignReportRow(
+                    metadata=AppsReportingCampaign(id=102, name="Alpha Null Total"),
+                    granularMetrics=[_campaign_metrics(date(2026, 11, 1), impressions=50, taps=5, spend="5.00")],
+                    totalMetrics=AppsCampaignMetrics(),
+                ),
+            ]
+        ),
+        pagination=V1Pagination(offset=0, pageSize=5000, totalCount=2),
+    )
+    _set_empty_subordinate_reports(non_comp_client)
+    non_comp_doc = collect_app_report_export(
+        non_comp_client,
+        adam_id=APP_A_ID,
+        start_date=date(2026, 11, 1),
+        end_date=date(2026, 11, 1),
+        today=FIXED_TODAY,
+        collected_at=FIXED_NOW,
+    )
+    assert non_comp_doc["complete"] is True
+    assert non_comp_doc["reconciliation"]["api_totals"]["status"] == "not_checked"
+    assert non_comp_doc["reconciliation"]["api_totals"]["matches"] is None
+    non_comp_checks = {
+        c["entity"]["campaign_id"]: c
+        for c in non_comp_doc["reconciliation"]["levels"]["campaigns"]["api_totals"]["checks"]
+    }
+    assert non_comp_checks[101]["not_checked_reason"] == "currency_mismatch"
+    assert non_comp_checks[102]["not_checked_reason"] == "no_comparable_fields"
