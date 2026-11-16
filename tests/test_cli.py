@@ -3,6 +3,7 @@
 import importlib.metadata
 import io
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -319,17 +320,27 @@ def test_pyproject_rejects_conflicting_client_releases() -> None:
     assert "asa-client" in client_eps
 
 
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def _plain_stdout(proc: subprocess.CompletedProcess[str]) -> str:
+    """Return subprocess stdout stripped of Rich/Typer ANSI styling codes."""
+    return _ANSI_RE.sub("", proc.stdout)
+
+
 def _assert_installed_asa_surface(asa_bin: Path, outside_dir: Path, clean_env: dict[str, str]) -> None:
     """Verify executable identity and core CLI/analyze help from outside the source checkout."""
     ver = subprocess.run([str(asa_bin), "--version"], cwd=outside_dir, env=clean_env, capture_output=True, text=True)
     assert ver.returncode == 0, ver.stderr
-    assert ver.stdout.startswith("asa-api-cli ")
-    assert "(asa-api-client " in ver.stdout
+    ver_out = _plain_stdout(ver)
+    assert ver_out.startswith("asa-api-cli ")
+    assert "(asa-api-client " in ver_out
 
     root_help = subprocess.run([str(asa_bin), "--help"], cwd=outside_dir, env=clean_env, capture_output=True, text=True)
     assert root_help.returncode == 0, root_help.stderr
+    root_out = _plain_stdout(root_help)
     for expected_cmd in ("reports", "auth", "analyze", "v1-smoke"):
-        assert expected_cmd in root_help.stdout
+        assert expected_cmd in root_out
 
     rep_help = subprocess.run(
         [str(asa_bin), "reports", "export", "--help"],
@@ -339,7 +350,7 @@ def _assert_installed_asa_surface(asa_bin: Path, outside_dir: Path, clean_env: d
         text=True,
     )
     assert rep_help.returncode == 0, rep_help.stderr
-    assert "--app" in rep_help.stdout
+    assert "--app" in _plain_stdout(rep_help)
 
     auth_help = subprocess.run(
         [str(asa_bin), "auth", "--help"],
@@ -349,7 +360,7 @@ def _assert_installed_asa_surface(asa_bin: Path, outside_dir: Path, clean_env: d
         text=True,
     )
     assert auth_help.returncode == 0, auth_help.stderr
-    assert "accounts" in auth_help.stdout
+    assert "accounts" in _plain_stdout(auth_help)
 
     analyze_help = subprocess.run(
         [str(asa_bin), "analyze", "--help"],
@@ -359,8 +370,9 @@ def _assert_installed_asa_surface(asa_bin: Path, outside_dir: Path, clean_env: d
         text=True,
     )
     assert analyze_help.returncode == 0, analyze_help.stderr
-    assert "--period" in analyze_help.stdout
-    assert "--output" in analyze_help.stdout
+    analyze_out = _plain_stdout(analyze_help)
+    assert "--period" in analyze_out
+    assert "--output" in analyze_out
 
 
 def _uv_pip_install(uv_bin: str, venv_python: Path, outside_dir: Path, args: list[str]) -> None:
@@ -410,9 +422,14 @@ def test_isolated_install_with_analyze_extra_and_client_reinstall_preserves_asa(
     # 1. Fresh install of built asa-api-cli[analyze] wheel into isolated venv
     _uv_pip_install(uv_bin, venv_python, outside_dir, [f"asa-api-cli[analyze] @ {wheel_path.as_uri()}"])
 
-    clean_env = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH", "VIRTUAL_ENV")}
+    clean_env = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in ("PYTHONPATH", "VIRTUAL_ENV", "GITHUB_ACTIONS", "FORCE_COLOR", "PY_COLORS", "CLICOLOR_FORCE")
+    }
     clean_env["PYTHONNOUSERSITE"] = "1"
     clean_env["NO_COLOR"] = "1"
+    clean_env["TERM"] = "dumb"
 
     assert asa_bin.is_file()
     assert asa_client_bin.is_file()
@@ -426,8 +443,9 @@ def test_isolated_install_with_analyze_extra_and_client_reinstall_preserves_asa(
         text=True,
     )
     assert client_help.returncode == 0, client_help.stderr
-    assert "analyze" in client_help.stdout
-    assert "smoke" in client_help.stdout
+    client_out = _plain_stdout(client_help)
+    assert "analyze" in client_out
+    assert "smoke" in client_out
 
     # 2. Reinstall supported asa-api-client dependency and verify `asa` was NOT overwritten
     _uv_pip_install(
