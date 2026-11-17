@@ -111,9 +111,9 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "asa-api-client", specifier = ">=1.0.1" },
-    { name = "asa-api-client", extras = ["cli"], marker = "extra == 'analyze'", specifier = ">=1.0.1" },
-    { name = "asa-api-client", extras = ["cli"], marker = "extra == 'dev'", specifier = ">=1.0.1" },
+    { name = "asa-api-client", specifier = ">=1.0.2" },
+    { name = "asa-api-client", extras = ["cli"], marker = "extra == 'analyze'", specifier = ">=1.0.2" },
+    { name = "asa-api-client", extras = ["cli"], marker = "extra == 'dev'", specifier = ">=1.0.2" },
     { name = "hatchling", marker = "extra == 'dev'", specifier = ">=1.25.0" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.13.0" },
     { name = "packaging", marker = "extra == 'dev'", specifier = ">=24.0" },
@@ -131,7 +131,7 @@ provides-extras = ["analyze", "dev"]
 
 [[package]]
 name = "asa-api-client"
-version = "1.0.1"
+version = "1.0.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "httpx" },
@@ -139,9 +139,9 @@ dependencies = [
     { name = "pydantic-settings" },
     { name = "pyjwt", extra = ["crypto"] },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/6e/5e/341136bc96b99ecf08d72531321f26b00361ed696a9ae63af6d45ed37c22/asa_api_client-1.0.1.tar.gz", hash = "sha256:0d3af7b80f0858d4acb9ce50618013dada69070125e27c670d67aaf74e8c41cc", size = 350039, upload-time = "2026-11-16T00:06:13.74Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/5d/27/56af8d8c1cbc6447a6f2bf9f24a4294526b62e7668c13f553c3e5c7f459c/asa_api_client-1.0.2.tar.gz", hash = "sha256:3354463fde0ffd02e2a4671542ae00d09932e456a4c9df630657e954fd3609e5", size = 350391, upload-time = "2026-11-16T23:58:06.787Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/df/7e/d60fab6186fce739cbb24969df3cea1a1087fb4cc434338206419e4fcd14/asa_api_client-1.0.1-py3-none-any.whl", hash = "sha256:addf6b7aadd5104c0ef3ad7ca2e92762d9b75bec047d9df90fee2a2066d711bc", size = 156501, upload-time = "2026-11-16T00:06:11.873Z" },
+    { url = "https://files.pythonhosted.org/packages/bd/1c/d6ef4e33abf0fecc243cf179c7a872070941378ffe40a07ada2c1a668ea7/asa_api_client-1.0.2-py3-none-any.whl", hash = "sha256:65bdffd7aadb738dfc7e408c4952f84a295287df668374f3fe9f2935aed93f91", size = 156650, upload-time = "2026-11-16T23:58:05.088Z" },
 ]
 
 [package.optional-dependencies]

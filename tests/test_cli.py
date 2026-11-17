@@ -293,7 +293,7 @@ def test_pydantic_ai_agents_construct() -> None:
 
 
 def test_pyproject_rejects_conflicting_client_releases() -> None:
-    """Issue #74: Dependency bounds exclude asa-api-client<=1.0.0 that claimed the `asa` script."""
+    """Issues #74 & #75: Dependency bounds exclude asa-api-client<1.0.2."""
     repo_root = Path(__file__).resolve().parents[1]
     pyproject = tomllib.loads((repo_root / "pyproject.toml").read_text(encoding="utf-8"))
 
@@ -303,13 +303,15 @@ def test_pyproject_rejects_conflicting_client_releases() -> None:
     client_core = next(r for r in core_reqs if r.name == "asa-api-client")
     assert not client_core.specifier.contains("0.6.1")
     assert not client_core.specifier.contains("1.0.0")
-    assert client_core.specifier.contains("1.0.1")
+    assert not client_core.specifier.contains("1.0.1")
+    assert client_core.specifier.contains("1.0.2")
 
     analyze_reqs = [Requirement(r) for r in pyproject["project"]["optional-dependencies"]["analyze"]]
     client_analyze = next(r for r in analyze_reqs if r.name == "asa-api-client")
     assert "cli" in client_analyze.extras
     assert not client_analyze.specifier.contains("1.0.0")
-    assert client_analyze.specifier.contains("1.0.1")
+    assert not client_analyze.specifier.contains("1.0.1")
+    assert client_analyze.specifier.contains("1.0.2")
 
     client_eps = [
         ep.name
@@ -452,6 +454,6 @@ def test_isolated_install_with_analyze_extra_and_client_reinstall_preserves_asa(
         uv_bin,
         venv_python,
         outside_dir,
-        ["--reinstall-package", "asa-api-client", "asa-api-client[cli]>=1.0.1"],
+        ["--reinstall-package", "asa-api-client", "asa-api-client[cli]>=1.0.2"],
     )
     _assert_installed_asa_surface(asa_bin, outside_dir, clean_env)

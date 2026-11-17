@@ -266,11 +266,11 @@ def list_accounts(
                         name = detail.name or name
                         if detail.org_id is not None:
                             org_id = detail.org_id
-                        currency = detail.currency or "-"
+                        currency = enum_value(detail.currency) or "-"
                         tz = detail.timezone or "-"
                         payment_model = enum_value(detail.payment_model) or "-"
                         status = enum_value(detail.system_status) or "-"
-                    except AppleSearchAdsError:
+                    except (AppleSearchAdsError, ValidationError):
                         pass
 
                     rows.append(
@@ -286,7 +286,7 @@ def list_accounts(
                         }
                     )
 
-            if not rows:
+            if not rows and not cli_state.json_output and format != OutputFormat.JSON:
                 print_warning("No accessible ad accounts found")
                 return
 
@@ -347,11 +347,11 @@ def list_orgs(
                     try:
                         org = client.orgs.get(oid)
                         org_name = org.name or org_name
-                        currency = org.currency or "-"
+                        currency = enum_value(org.currency) or "-"
                         payment_model = enum_value(org.payment_model) or "-"
                         status = enum_value(org.system_status) or "-"
                         tz = org.timezone or "-"
-                    except AppleSearchAdsError:
+                    except (AppleSearchAdsError, ValidationError):
                         pass
 
                     rows.append(
@@ -367,7 +367,7 @@ def list_orgs(
                         }
                     )
 
-            if not rows:
+            if not rows and not cli_state.json_output and format != OutputFormat.JSON:
                 print_warning("No accessible organizations found")
                 return
 

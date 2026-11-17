@@ -35,7 +35,7 @@ Using pipx:
 pipx install asa-api-cli
 ```
 
-> **Note (`asa-api-client>=1.0.1`):** `asa-api-cli` owns the `asa` command (including `asa analyze` and `asa v1-smoke`). Starting in `asa-api-client` `1.0.1`, the client library's standalone console script was renamed to `asa-client` so installing or upgrading `asa-api-client` cannot overwrite `asa`.
+> **Note (`asa-api-client>=1.0.2`):** `asa-api-cli` owns the `asa` command (including `asa analyze` and `asa v1-smoke`). Starting in `asa-api-client` `1.0.1`, the client library's standalone console script was renamed to `asa-client` so installing or upgrading `asa-api-client` cannot overwrite `asa` (`1.0.2` adds support for automated App Store account product features during account discovery).
 
 ## Setup
 

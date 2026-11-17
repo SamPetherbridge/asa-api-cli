@@ -4,9 +4,11 @@ import json
 from datetime import UTC, date, datetime
 from unittest.mock import MagicMock
 
+import httpx
 import pytest
 from asa_api_client.exceptions import ConfigurationError
-from asa_api_client.v1.models.ad_accounts import AclAdAccount, AdAccount, Me, UserAcl
+from asa_api_client.v1.client import AppleAdsClient
+from asa_api_client.v1.models.ad_accounts import AclAdAccount, AdAccount, Me, ProductFeatures, UserAcl
 from asa_api_client.v1.models.ad_groups import AdGroup
 from asa_api_client.v1.models.ads import Ad
 from asa_api_client.v1.models.apps import (
@@ -722,3 +724,159 @@ def test_brand_dry_run_and_optimize_bid_check(monkeypatch: pytest.MonkeyPatch) -
     fix_res = runner.invoke(main_mod.app, ["optimize", "bid-check", "--threshold", "10", "--auto-fix"])
     assert fix_res.exit_code == 0
     opt_client.ad_groups.update.assert_called_once()
+
+
+def _build_transport_client(handler: object) -> AppleAdsClient:
+    """Create a real AppleAdsClient backed by httpx.MockTransport without real keys or network."""
+    client = AppleAdsClient.__new__(AppleAdsClient)
+    client.ad_account_id = None
+    client._base_url = "https://api.ads.apple.com/v1"
+    client._timeout = 10.0
+    client.max_retries = 0
+    client.retry_initial_delay = 0.0
+    client.retry_max_delay = 0.0
+    client.retry_jitter = False
+    fake_auth = MagicMock()
+    fake_auth.get_access_token.return_value = MagicMock(authorization_header="Bearer test-token")
+    client._authenticator = fake_auth
+    client._http_client = httpx.Client(transport=httpx.MockTransport(handler))  # type: ignore[arg-type]
+    client._async_http_client = None
+    client._owns_http_clients = True
+    client._parent_client = None
+    client._init_resources()
+    return client
+
+
+def test_auth_accounts_handles_appstore_app_automated_and_json_modes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #75: Account discovery accepts APPSTORE_APP_AUTOMATED across table and JSON modes."""
+    parsed_direct = AdAccount.model_validate(
+        {
+            "id": 1002,
+            "name": "Automated App Account",
+            "orgId": 500,
+            "currency": "USD",
+            "timezone": "America/Los_Angeles",
+            "paymentModel": "PAYG",
+            "systemStatus": "ACTIVE",
+            "productFeatures": ["APPSTORE_APP_AUTOMATED"],
+        }
+    )
+    assert parsed_direct.product_features == [ProductFeatures.APPSTORE_APP_AUTOMATED]
+
+    account_details = {
+        "1001": {
+            "id": 1001,
+            "name": "Manual App Account",
+            "orgId": 500,
+            "currency": "AUD",
+            "timezone": "Australia/Brisbane",
+            "paymentModel": "PAYG",
+            "systemStatus": "ACTIVE",
+            "productFeatures": ["APPSTORE_APP_MANUAL"],
+        },
+        "1002": {
+            "id": 1002,
+            "name": "Automated App Account",
+            "orgId": 500,
+            "currency": "USD",
+            "timezone": "America/Los_Angeles",
+            "paymentModel": "PAYG",
+            "systemStatus": "ACTIVE",
+            "productFeatures": ["APPSTORE_APP_AUTOMATED"],
+        },
+        "1003": {
+            "id": 1003,
+            "name": "Maps Brand Account",
+            "orgId": 501,
+            "currency": "GBP",
+            "timezone": "Europe/London",
+            "paymentModel": "LOC",
+            "systemStatus": "INACTIVE",
+            "productFeatures": ["BUSINESS_BRAND_MANUAL"],
+        },
+    }
+
+    def mock_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/acls":
+            return httpx.Response(
+                200,
+                json={
+                    "result": {
+                        "acls": [
+                            {
+                                "adAccount": {"id": 1001, "name": "Manual ACL", "orgId": 500},
+                                "roles": ["Admin"],
+                            },
+                            {
+                                "adAccount": {"id": 1002, "name": "Automated ACL", "orgId": 500},
+                                "roles": ["API Account Manager"],
+                            },
+                            {
+                                "adAccount": {"id": 1003, "name": "Maps ACL", "orgId": 501},
+                                "roles": ["Read Only"],
+                            },
+                        ]
+                    }
+                },
+            )
+        if request.method == "GET" and request.url.path.startswith("/v1/ad-accounts/"):
+            acct_key = request.url.path.rsplit("/", 1)[-1]
+            assert request.headers.get("x-ap-context") == f"adAccountId={acct_key}"
+            return httpx.Response(200, json={"result": account_details[acct_key]})
+        raise AssertionError(f"Unexpected HTTP call: {request.method} {request.url.path}")
+
+    monkeypatch.setattr(auth, "get_client", lambda **_kw: _build_transport_client(mock_handler))
+
+    # 1. Readable table output (80-col Rich table wraps multi-word names across lines)
+    res_table = runner.invoke(main_mod.app, ["auth", "accounts"])
+    assert res_table.exit_code == 0, res_table.output
+    for expected in (
+        "Accessible ad accounts",
+        "1001",
+        "Manual",
+        "1002",
+        "Automat",
+        "1003",
+        "Maps",
+        "AUD",
+        "USD",
+        "GBP",
+    ):
+        assert expected in res_table.stdout
+
+    # 2. Documented `--format json` output
+    res_fmt_json = runner.invoke(main_mod.app, ["auth", "accounts", "--format", "json"])
+    assert res_fmt_json.exit_code == 0, res_fmt_json.output
+    fmt_rows = json.loads(res_fmt_json.stdout)
+    assert [r["ad_account_id"] for r in fmt_rows] == [1001, 1002, 1003]
+    assert fmt_rows[0]["currency"] == "AUD"
+    assert fmt_rows[1]["name"] == "Automated App Account"
+    assert fmt_rows[1]["currency"] == "USD"
+    assert fmt_rows[1]["time_zone"] == "America/Los_Angeles"
+    assert fmt_rows[1]["payment_model"] == "PAYG"
+    assert fmt_rows[1]["status"] == "ACTIVE"
+    assert fmt_rows[2]["currency"] == "GBP"
+
+    # 3. Global `--no-input --json` mode (exact invocation from Issue #75)
+    res_global_json = runner.invoke(main_mod.app, ["--no-input", "--json", "auth", "accounts"])
+    assert res_global_json.exit_code == 0, res_global_json.output
+    assert json.loads(res_global_json.stdout) == fmt_rows
+
+    # 4. Defense-in-depth: unexpected schema error on optional detail enrichment falls back to ACL row
+    def malformed_detail_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/acls":
+            return mock_handler(request)
+        acct_key = request.url.path.rsplit("/", 1)[-1]
+        if acct_key == "1002":
+            return httpx.Response(200, json={"result": {"id": 1002, "orgId": "not-an-int"}})
+        return mock_handler(request)
+
+    monkeypatch.setattr(auth, "get_client", lambda **_kw: _build_transport_client(malformed_detail_handler))
+    res_fallback = runner.invoke(main_mod.app, ["--no-input", "--json", "auth", "accounts"])
+    assert res_fallback.exit_code == 0, res_fallback.output
+    fb_rows = json.loads(res_fallback.stdout)
+    assert [r["ad_account_id"] for r in fb_rows] == [1001, 1002, 1003]
+    assert fb_rows[1]["name"] == "Automated ACL"
+    assert fb_rows[1]["currency"] == "-"
