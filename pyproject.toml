@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "asa-api-cli"
-version = "0.5.1"
+version = "0.5.2"
 description = "Command-line interface for Apple Ads Platform API v1"
 readme = "README.md"
 license = "MIT"
